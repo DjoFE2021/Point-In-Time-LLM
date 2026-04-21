@@ -1,7 +1,7 @@
 import os
 def get_embeddings_path(model_name:str) -> str:
     
-    base_dir = "/Users/jschwab/Desktop/Projects/data/embeddings"
+    base_dir = "/srv/datasets/DOW_JONES_NEWSWIRE/embeddings"
     model_dir = os.path.join(base_dir, model_name, "embeddings_monthly.pkl")
     
     if "dummy" in model_name:

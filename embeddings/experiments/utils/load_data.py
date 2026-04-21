@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 
-def load_jkp(file_path : str = "/Users/jschwab/Desktop/Projects/data/usa_153_per_size_ranks_False.pkl") -> pd.DataFrame: 
+def load_jkp(file_path : str = "/srv/datasets/JKP/usa_132_per_size_ranks_False_permno_False_float32.pkl") -> pd.DataFrame: 
     
     df = pd.read_pickle(file_path)
     df = df[["id", "date", "size_grp", "r_1"]].copy()
@@ -43,7 +43,7 @@ def load_embeddings(file_path: str) -> pd.DataFrame:
 
 def load_matched_ret_emb(
     emb_path: str,
-    jkp_path: str = "/Users/jschwab/Desktop/Projects/data/usa_153_per_size_ranks_False.pkl",
+    jkp_path: str = "/srv/datasets/JKP/usa_132_per_size_ranks_False_permno_False_float32.pkl",
     emb_dim: int = 15,
 ) -> pd.DataFrame:
 
@@ -59,7 +59,14 @@ def load_matched_ret_emb(
         )
         
     merged_df = jkp_df.join(emb_df, how="inner")
-    
+
+    # Cross-sectionally demean embeddings at each date to remove the market component
+    emb_cols = [c for c in merged_df.columns if c not in ("r_1", "size_grp")]
+    dates = merged_df.index.get_level_values("date")
+    merged_df[emb_cols] = merged_df.groupby(dates)[emb_cols].transform(
+        lambda x: x - x.mean()
+    )
+
     return merged_df
     
     

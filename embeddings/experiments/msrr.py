@@ -11,11 +11,14 @@ from utils.path_manager import get_embeddings_path
 from utils.ridge import Ridge
 from utils.constants import DEFAULT_SHRINKAGE_GRID
 
-MODELS          = ["chronogpt_base", "chronogpt_instruct"]
-SIZE_GROUPS     = ["large", "small", "mega", "micro", "all"]
+MODELS          = ["chronogpt_base-right", "chronogpt_instruct-right", "PIT-4B-right", "PIT-4B-FT-right"]
+MODEL_LABELS    = ["ChronoGPT-base", "ChronoGPT-instruct", "PIT-4B", "PIT-4B-FT"]
+MODEL_COLORS    = ["#10b981", "#f59e0b", "#2563eb", "#9ca3af"]   # green, amber, blue, light grey
+SIZE_GROUPS     = ["micro", "small", "large", "mega", "all"]
 ROLLING_WINDOWS = [360]
 PORTFOLIOS      = ["linear", "random_feature"]
-N_RANDOM_FEAT   = 100
+PORTFOLIO_TITLES = {"linear": "Linear", "random_feature": "Random Features"}
+N_RANDOM_FEAT   = 70
 
 _BASE    = os.path.dirname(os.path.abspath(__file__))
 RAW_DIR  = os.path.join(_BASE, "results", "raw",   "msrr")
@@ -27,7 +30,7 @@ RESULTS_PATHS = {
     "linear":         os.path.join(RAW_DIR, "results_msrr_linear.pkl"),
     "random_feature": os.path.join(RAW_DIR, "results_msrr_random_feature.pkl"),
 }
-SPLIT_DATE      = pd.Timestamp("2013-12-31")
+SPLIT_DATE = pd.Timestamp("2013-12-31")
 
 PERIODS = {
     "Full sample":   (None, None),
@@ -139,56 +142,97 @@ def run_all():
     return results
 
 
+def _avg_sharpe(results, portfolio, model, sg, T, period):
+    """Average Sharpe across all z values on the shrinkage grid."""
+    arr = results[portfolio][model][sg][T][period]   # shape (n_z,)
+    return float(np.mean(arr))
+
+
 def print_table(model_results, portfolio):
     T = ROLLING_WINDOWS[0]
     table = pd.DataFrame(index=SIZE_GROUPS, columns=list(PERIODS.keys()), dtype=float)
     for sg in SIZE_GROUPS:
         if T in model_results[sg]:
             for label in PERIODS:
-                table.loc[sg, label] = model_results[sg][T][label].max()
-    print(f"\n    Best OOS Sharpe [{portfolio}] T={T} (max over z):")
+                table.loc[sg, label] = np.mean(model_results[sg][T][label])
+    print(f"\n    Avg Sharpe (mean over z grid) [{portfolio}] T={T}:")
     print(table.to_string(float_format="{:.3f}".format))
     print()
 
 
 def plot_results(results):
-    x = np.arange(len(SIZE_GROUPS))
-    w = 0.35
-    T = ROLLING_WINDOWS[0]
+    T        = ROLLING_WINDOWS[0]
+    period   = "Out-of-sample"
+    n_models = len(MODELS)
+    n_groups = len(SIZE_GROUPS)
+    x        = np.arange(n_groups)
+    total_w  = 0.65
+    bar_w    = total_w / n_models
 
-    for portfolio in PORTFOLIOS:
-        for z_idx, z_val in enumerate(DEFAULT_SHRINKAGE_GRID):
-            fig, axes = plt.subplots(
-                len(PERIODS), 1,
-                figsize=(8, 4 * len(PERIODS)),
-                sharey=False,
+    fig, axes = plt.subplots(
+        len(PORTFOLIOS), 1,
+        figsize=(9, 4 * len(PORTFOLIOS)),
+        facecolor="white",
+    )
+    if len(PORTFOLIOS) == 1:
+        axes = [axes]
+
+    for ax, portfolio in zip(axes, PORTFOLIOS):
+        ax.set_facecolor("white")
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.6, color="#cccccc", zorder=0)
+        ax.set_axisbelow(True)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        ax.axhline(0, color="#999999", linewidth=0.8, linestyle="--", zorder=1)
+
+        for m_idx, (model, label, color) in enumerate(zip(MODELS, MODEL_LABELS, MODEL_COLORS)):
+            sharpe_vals = [
+                _avg_sharpe(results, portfolio, model, sg, T, period)
+                for sg in SIZE_GROUPS
+            ]
+            offset = (m_idx - (n_models - 1) / 2) * bar_w
+            bars = ax.bar(
+                x + offset, sharpe_vals, bar_w,
+                label=label, color=color, zorder=2, edgecolor="none",
             )
-            fig.suptitle(f"OOS Sharpe [{portfolio}]  T={T}  —  z = {z_val:.0e}", fontsize=13)
+            for bar, val in zip(bars, sharpe_vals):
+                va  = "bottom" if val >= 0 else "top"
+                pad = 0.01  if val >= 0 else -0.01
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    val + pad,
+                    f"{val:.2f}",
+                    ha="center", va=va,
+                    fontsize=7, color="#333333",
+                )
 
-            for row_idx, period_label in enumerate(PERIODS):
-                ax = axes[row_idx]
+        ax.set_title(PORTFOLIO_TITLES[portfolio], fontsize=12, fontweight="bold", pad=8)
+        ax.set_ylabel("Sharpe ratio", fontsize=9)
+        ax.set_xlabel("Size group", fontsize=9)
+        ax.set_xticks(x)
+        ax.set_xticklabels(SIZE_GROUPS, fontsize=9)
 
-                for m_idx, model in enumerate(MODELS):
-                    sharpe_vals = [
-                        results[portfolio][model][sg][T][period_label][z_idx]
-                        for sg in SIZE_GROUPS
-                    ]
-                    offset = (m_idx - (len(MODELS) - 1) / 2) * w
-                    ax.bar(x + offset, sharpe_vals, w, label=model)
+        ymin, ymax = ax.get_ylim()
+        if portfolio == "linear":
+            ymin = -0.5
+        tick_min = np.ceil(ymin / 0.2) * 0.2
+        tick_max = np.floor(ymax / 0.2) * 0.2
+        ax.set_yticks(np.arange(tick_min, tick_max + 1e-9, 0.2))
+        ax.set_ylim(ymin, ymax)
 
-                ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-                ax.set_ylabel(f"{period_label}\nSharpe", fontsize=9)
-                ax.set_xticks(x)
-                ax.set_xticklabels(SIZE_GROUPS, fontsize=9)
-                ax.legend(fontsize=7)
-                if row_idx == len(PERIODS) - 1:
-                    ax.set_xlabel("Size group", fontsize=9)
+        legend_loc = "lower right" if portfolio == "linear" else "upper right"
+        ax.legend(
+            fontsize=8, frameon=True,
+            loc=legend_loc,
+            framealpha=1.0,
+            edgecolor="#cccccc",
+            fancybox=False,
+        )
 
-            plt.tight_layout()
-            fname = os.path.join(PLOT_DIR, f"msrr_{portfolio}_z{z_idx:02d}_1e{int(np.log10(z_val))}.png")
-            plt.savefig(fname, dpi=150)
-            plt.close()
-            print(f"Saved {fname}")
+    plt.tight_layout(pad=2.0)
+    fname = os.path.join(PLOT_DIR, "msrr_oos_avg_z.png")
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {fname}")
 
 
 if __name__ == "__main__":
