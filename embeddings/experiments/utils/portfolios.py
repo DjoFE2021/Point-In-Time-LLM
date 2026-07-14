@@ -44,6 +44,8 @@ def produce_random_feature_managed_returns_chunked(
 
         if activation == "relu":
             Z = np.maximum(0, Z)
+        elif activation == "gelu":
+            Z = 0.5 * Z * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (Z + 0.044715 * Z**3)))
         elif activation == "sincos":
             Z = np.concatenate([np.sqrt(2.0) * np.sin(Z), np.sqrt(2.0) * np.cos(Z)], axis=1)
         else:

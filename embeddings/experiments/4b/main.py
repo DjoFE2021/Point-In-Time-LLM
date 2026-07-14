@@ -11,8 +11,9 @@ import tiktoken
 from collections import OrderedDict
 from pathlib import Path
 
-# Make models/ importable
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Make models/ importable (repo root — this file lives at
+# <root>/embeddings/experiments/4b/main.py, so the root is parents[3])
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from models.GPT import GPT
 from models.GPTConfig import GPT2_4B
 
