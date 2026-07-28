@@ -21,7 +21,7 @@ export PYTHONPATH="/home/jschwab/FinGPT:$PYTHONPATH"
 export PYTHONUNBUFFERED=1
 
 mkdir -p /home/jschwab/FinGPT/embeddings/4b-ft/logs
-mkdir -p /scratch/jschwab/embeddings/4b-ft-full
+mkdir -p /scratch/jschwab/embeddings/4b-ft-full-v2
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"

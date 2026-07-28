@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #SBATCH --job-name=chronogpt-embed
-#SBATCH --partition=l40s
+#SBATCH --partition=h100
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=360G
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/home/jschwab/FinGPT/embeddings/chronoGPT/logs/%j.out
 #SBATCH --error=/home/jschwab/FinGPT/embeddings/chronoGPT/logs/%j.err
 
@@ -22,7 +22,7 @@ if [ ! -d "$VENV" ]; then
     "$VENV/bin/pip" install torch tiktoken pandas huggingface_hub
 fi
 
-source "$VENV/bin/activate"
+export PATH="$VENV/bin:$PATH"
 
 SCRIPT_DIR=/home/jschwab/FinGPT/embeddings/chronoGPT
 cd "$SCRIPT_DIR"
@@ -34,15 +34,15 @@ export PYTHONUNBUFFERED=1
 
 mkdir -p /home/jschwab/FinGPT/embeddings/chronoGPT/logs
 mkdir -p /scratch/jschwab/hf
-mkdir -p /scratch/jschwab/embeddings/chronogpt_instruct
-mkdir -p /scratch/jschwab/embeddings/chronogpt_base
+mkdir -p /scratch/jschwab/embeddings/chronogpt_instruct-v2
+mkdir -p /scratch/jschwab/embeddings/chronogpt_base-v2
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"
 echo "Started  : $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-MODEL_TYPE=base   # change to "base" for the base model
+MODEL_TYPE=instruct  # change to "base" for the base model
 echo "Model type: $MODEL_TYPE"
 
 srun python main.py --model-type "$MODEL_TYPE"

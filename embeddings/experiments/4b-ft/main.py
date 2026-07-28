@@ -12,9 +12,12 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import List, Tuple, Optional
 
-# Make models/ importable (repo root — this file lives at
-# <root>/embeddings/experiments/4b-ft/main.py, so the root is parents[3])
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+# Make models/ importable — the repo root is the nearest ancestor holding models/,
+# which keeps this working under both the repo layout (embeddings/experiments/4b-ft)
+# and the flat cluster layout (embeddings/4b-ft).
+sys.path.insert(0, str(next(
+    p for p in Path(__file__).resolve().parents if (p / "models").is_dir()
+)))
 from models.GPT import GPT
 from models.GPTConfig import GPT2_4B
 
@@ -22,7 +25,7 @@ DATASET_DIR       = "/scratch/jschwab/dataset/jkp_matched"
 CKPT_DIR          = "/scratch/jschwab/checkpoints/4B-FT"
 CKPT_DIR_FULL     = "/scratch/jschwab/checkpoints/4B-FT-full"
 OUTPUT_DIR        = "/scratch/jschwab/embeddings/4b-ft-v2"
-OUTPUT_DIR_FULL   = "/scratch/jschwab/embeddings/4b-ft-full"
+OUTPUT_DIR_FULL   = "/scratch/jschwab/embeddings/4b-ft-full-v2"
 MAX_TOKENS        = 2048
 BATCH_SIZE        = 64
 
@@ -91,9 +94,9 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
     after the last transformer block, identical to what lm_head projects.
 
     Args:
-        padding: "left" pads on the left so the last real token is always at
-                 position -1.  "right" pads on the right and uses each
-                 article's true token length to index the last real token.
+        padding: "right" (default) pads on the right and uses each article's
+                 true token length to index the last real token.  "left" pads
+                 on the left so the last real token is always at position -1.
     """
     captured: dict = {}
 
@@ -106,18 +109,27 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
 
     handle = model.lm_head.register_forward_pre_hook(_pre_hook)
 
-    # Tokenize all articles upfront and sort by length to minimise padding waste
+    # Tokenize all articles upfront and sort by length to minimise padding waste.
+    # Articles that tokenize to nothing have no last real token, so they are held
+    # out of the batches and left as NaN for aggregation to drop — batching them
+    # would either index a pad position or produce a zero-width batch.
     all_token_ids = [tokenizer.encode(text)[:MAX_TOKENS] for text in articles]
-    sorted_indices = np.argsort([len(t) for t in all_token_ids])
-    sorted_token_ids = [all_token_ids[i] for i in sorted_indices]
+    n_embd = model.lm_head.weight.shape[1]
 
-    sorted_embs = np.empty((len(articles), ), dtype=object)
+    nonempty = [i for i, t in enumerate(all_token_ids) if len(t) > 0]
+    n_empty = len(articles) - len(nonempty)
+    if n_empty:
+        print(f"  {n_empty} empty article(s) → NaN embeddings", flush=True)
+    order = sorted(nonempty, key=lambda i: len(all_token_ids[i]))
+
+    result = np.full((len(articles), n_embd), np.nan, dtype=np.float32)
     try:
-        for i in range(0, len(sorted_token_ids), BATCH_SIZE):
-            batch_ids = sorted_token_ids[i : i + BATCH_SIZE]
+        for i in range(0, len(order), BATCH_SIZE):
+            batch_idx = order[i : i + BATCH_SIZE]
+            batch_ids = [all_token_ids[k] for k in batch_idx]
 
-            max_len = max(len(t) for t in batch_ids)
             lengths = [len(t) for t in batch_ids]
+            max_len = max(lengths)
 
             if padding == "right":
                 padded = [t + [0] * (max_len - len(t)) for t in batch_ids]
@@ -138,16 +150,13 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
             else:
                 batch_emb = hidden[:, -1, :]
 
-            for j, emb in enumerate(batch_emb):
-                sorted_embs[i + j] = emb
+            # Scatter back into original article order
+            for j, k in enumerate(batch_idx):
+                result[k] = batch_emb[j]
     finally:
         handle.remove()
 
-    # Restore original article order
-    result = np.empty((len(articles), ), dtype=object)
-    for sorted_pos, orig_pos in enumerate(sorted_indices):
-        result[orig_pos] = sorted_embs[sorted_pos]
-    return np.vstack(result)
+    return result
 
 
 def build_work_list(out_dir: Path, last_ckpt: bool = False) -> List[Tuple[Optional[Tuple[int, int]], str]]:
@@ -184,6 +193,11 @@ def aggregate_embeddings(out_dir: Path) -> None:
 
     combined = pd.concat(chunks, ignore_index=True)
     combined = combined.dropna(subset=["permno", "Date", "embedding"])
+    # Empty articles carry NaN vectors — drop them so they cannot poison a mean
+    finite = combined["embedding"].map(lambda e: e is not None and np.all(np.isfinite(e)))
+    if not finite.all():
+        print(f"  Dropping {(~finite).sum()} rows with non-finite embeddings.")
+    combined = combined[finite]
     combined["year_month"] = (
         combined["Date"].astype(str).str[:4] + "-" + combined["Date"].astype(str).str[4:6]
     )

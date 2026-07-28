@@ -1,8 +1,8 @@
 #!/bin/bash -l
 #SBATCH --job-name=4b-embed
-#SBATCH --partition=l40s
+#SBATCH --partition=h100
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=360G
 #SBATCH --time=48:00:00
@@ -13,7 +13,7 @@ module purge
 module load python cuda 2>/dev/null || true
 
 VENV=/scratch/jschwab/venvs/chronogpt
-source "$VENV/bin/activate"
+export PATH="$VENV/bin:$PATH"
 
 SCRIPT_DIR=/home/jschwab/FinGPT/embeddings/4b
 cd "$SCRIPT_DIR"
@@ -21,7 +21,7 @@ export PYTHONPATH="/home/jschwab/FinGPT:$PYTHONPATH"
 export PYTHONUNBUFFERED=1
 
 mkdir -p /home/jschwab/FinGPT/embeddings/4b/logs
-mkdir -p /scratch/jschwab/embeddings/4b
+mkdir -p /scratch/jschwab/embeddings/4b-v2
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"

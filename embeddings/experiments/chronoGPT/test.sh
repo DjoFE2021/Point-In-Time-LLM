@@ -22,7 +22,7 @@ if [ ! -d "$VENV" ]; then
     "$VENV/bin/pip" install torch tiktoken pandas huggingface_hub
 fi
 
-source "$VENV/bin/activate"
+export PATH="$VENV/bin:$PATH"
 
 SCRIPT_DIR=/home/jschwab/FinGPT/embeddings/chronoGPT
 cd "$SCRIPT_DIR"
@@ -34,8 +34,8 @@ export PYTHONUNBUFFERED=1
 
 mkdir -p /home/jschwab/FinGPT/embeddings/chronoGPT/logs
 mkdir -p /scratch/jschwab/hf
-mkdir -p /scratch/jschwab/embeddings/chronogpt_instruct
-mkdir -p /scratch/jschwab/embeddings/chronogpt_base
+mkdir -p /scratch/jschwab/embeddings/chronogpt_instruct-v2
+mkdir -p /scratch/jschwab/embeddings/chronogpt_base-v2
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"
