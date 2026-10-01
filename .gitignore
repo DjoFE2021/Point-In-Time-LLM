@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Data and outputs written by the scripts
+fineweb_pit/
+checkpoints/
+logs/
+model-sft/
+ifeval_outputs*/
+cache/
+data/post_training_dataset/
+data/sft_tokenized/
+embeddings/experiments/results/
+
+# Local settings (API keys, dataset paths)
+.env

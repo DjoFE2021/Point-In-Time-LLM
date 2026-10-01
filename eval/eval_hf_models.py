@@ -1,22 +1,7 @@
-"""
-Evaluate standard HuggingFace models on the same benchmark suite
-as eval_hellaswag_multigpu.py (Common Sense Reasoning by default).
+"""Evaluate HuggingFace models with lm-eval's built-in 'hf' backend on the same suite as eval_multigpu.py.
 
-Uses lm-eval's built-in 'hf' model type — no custom adapter needed.
-
-Usage:
-    # Evaluate GPT-2 on the full CSR suite (0-shot)
-    python eval/eval_hf_models.py --models gpt2
-
-    # Compare multiple models
-    python eval/eval_hf_models.py \
-        --models gpt2 Qwen/Qwen1.5-1.8B-Chat meta-llama/Llama-2-7b-hf
-
-    # Quick debug with limits
-    python eval/eval_hf_models.py --models gpt2 --limit 20 --tasks hellaswag
-
-    # Custom tasks and few-shot
-    python eval/eval_hf_models.py --models gpt2 --tasks mmlu --num-fewshot 5
+Defaults to the 0-shot Common Sense Reasoning tasks; writes one CSV per model to --output-dir.
+Usage: python eval/eval_hf_models.py --models gpt2 [Qwen/Qwen1.5-1.8B-Chat ...] [--tasks hellaswag] [--limit 20]
 """
 
 import argparse
@@ -129,7 +114,7 @@ def main():
 
         rows = extract_scores(results)
 
-        # Save CSV (same format as eval_hellaswag_multigpu.py)
+        # Save CSV (same columns as eval_multigpu.py)
         safe_name = model_name.replace("/", "_")
         result_file = os.path.join(args.output_dir, f"{safe_name}.csv")
         with open(result_file, "w", newline="") as f:
@@ -137,17 +122,16 @@ def main():
             w.writeheader()
             w.writerows(rows)
 
-        # Print summary
         print(f"\n{'='*60}")
         print(f"📄 {model_name} — saved to {result_file}")
         print(f"{'='*60}")
         for r in rows:
             print(f"  {r['task']:30s} {r['metric']:25s} {r['score']}")
 
-        # Compute and print average (over acc_norm or acc metrics)
+        # Print the average over tasks of the accuracy-type metrics
         acc_rows = [r for r in rows if "acc" in r["metric"]]
         if acc_rows:
-            # Take the best metric per task (prefer acc_norm over acc)
+            # One score per task, preferring metrics containing "norm" (acc_norm) over acc
             task_best = {}
             for r in acc_rows:
                 task = r["task"]

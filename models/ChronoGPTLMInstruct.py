@@ -1,19 +1,9 @@
-"""
-ChronoGPT Instruct model wrapper for AlpacaEval.
+"""ChronoGPT-Instruct baseline (HuggingFace Hub weights) with a simple text-generation wrapper.
+Adapted from ChronoGPT_instruct.py by manelalab (MIT licensed; see THIRD_PARTY_NOTICES.md).
 
-Loads the instruct-tuned ChronoGPT from HuggingFace Hub and provides
-a simple generate() interface compatible with alpaca.py.
-
-Usage in alpaca.py:
-    from models.ChronoGPTLMInstruct import ChronoGPTInstruct
-
-    wrapper = ChronoGPTInstruct.from_hub("manelalab/chrono-gpt-instruct-v1-20201231")
-    responses = wrapper.generate_batch(prompts, max_new_tokens=512)
+Used by eval/ifeval_test.py: ChronoGPTInstruct.from_hub(repo_id).generate_batch(prompts).
 """
 
-import os
-import json
-import math
 import gc
 from typing import List
 
@@ -24,15 +14,14 @@ from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 import tiktoken
 
 
-# ------------------------------------------------------------------
-# Architecture components (matches HF instruct repo exactly)
-# ------------------------------------------------------------------
+# Architecture components (mirror the modeling code of the HF instruct repo)
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
 class CastedLinear(nn.Linear):
+    """Bias-free linear layer that casts its weight to the input dtype."""
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
 
@@ -41,6 +30,7 @@ class CastedLinear(nn.Linear):
 
 
 class Rotary(nn.Module):
+    """Rotary embeddings where only half of the frequencies rotate (the other half are zero)."""
     def __init__(self, dim, max_seq_len=65536):
         super().__init__()
         self.dim = dim
@@ -91,6 +81,7 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
         k = self.c_k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.c_v(x).view(B, T, self.num_heads, self.head_dim)
+        # learned mix of the regular values and the value embedding (if this layer has one)
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v)
         else:
@@ -131,6 +122,7 @@ class Block(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, ve, x0):
+        # learned mix of the residual stream and the initial embedding x0
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
             x = x + self.attn(norm(x), ve)
@@ -139,6 +131,7 @@ class Block(nn.Module):
 
 
 class ValueEmbedding(nn.Module):
+    """Three token embeddings fed as extra values to the first 3 and last 3 layers (None elsewhere)."""
     def __init__(self, vocab_size, model_dim, num_layers=52):
         super().__init__()
         self.num_layers = num_layers
@@ -153,11 +146,13 @@ class ValueEmbedding(nn.Module):
         return encoder + decoder
 
 
-# ------------------------------------------------------------------
-# Core model (matches HF instruct repo -- forward returns logits only)
-# ------------------------------------------------------------------
+# Core model (as in the HF instruct repo; forward returns logits only)
 
 class ChronoGPT(nn.Module, PyTorchModelHubMixin):
+    """
+    modded-nanogpt style GPT: value embeddings, U-Net skip connections from the first
+    to the second half of the blocks, and tanh soft-capped logits.
+    """
     def __init__(self, vocab_size, num_layers, num_heads, model_dim, device=None):
         super().__init__()
         self.num_heads = num_heads
@@ -180,6 +175,7 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
         x0 = norm(self.embed(inputs).bfloat16())
         x = x0
 
+        # value embeddings per sample, regrouped into one (B, T, D) tensor per layer
         ve = [self.value_embeds(inputs[i].view(-1)) for i in range(B)]
         ve = [torch.stack([ve[b][i] for b in range(B)]) if ve[0][i] is not None else None
               for i in range(len(ve[0]))]
@@ -193,6 +189,7 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
         present = []
         skip_connections = []
 
+        # first half: keep each block's output for the skip connections
         for i in range(self.num_encoder_layers):
             block = self.blocks[i]
             x = block(x, ve_enc[i], x0)
@@ -201,6 +198,7 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
                 block.attn.kv_cache = None
             skip_connections.append(x)
 
+        # second half: add the stored outputs back in reverse order (U-Net style)
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
             block = self.blocks[self.num_encoder_layers + i]
@@ -211,11 +209,12 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
 
         x = norm(x)
         logits = self.lm_head(x)
-        logits = 15 * torch.tanh(logits / 15)
+        logits = 15 * torch.tanh(logits / 15)  # soft-cap logits to (-15, 15)
         return logits.float()
 
     @classmethod
     def from_pretrained(cls, repo_id, cache_dir=None, **kwargs):
+        """Download config.pt and pytorch_model.bin from the Hub and build the model."""
         config_path = hf_hub_download(repo_id=repo_id, filename="config.pt", cache_dir=cache_dir)
         bin_path = hf_hub_download(repo_id=repo_id, filename="pytorch_model.bin", cache_dir=cache_dir)
         config = torch.load(config_path, map_location="cpu")
@@ -224,9 +223,7 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
         return model
 
 
-# ------------------------------------------------------------------
-# High-level instruct wrapper for alpaca.py
-# ------------------------------------------------------------------
+# High-level instruct wrapper (prompt template + token-by-token generation)
 
 SYSTEM_PROMPT = (
     "You are ChronoGPT, a large language model trained by ManelaLab at WashU.\n"
@@ -246,7 +243,7 @@ def _format_instruct_prompt(instruction: str) -> str:
 class ChronoGPTInstruct:
     """
     Convenience wrapper that loads the instruct-tuned ChronoGPT and
-    exposes a simple generate_batch() interface for alpaca.py.
+    exposes a simple generate_batch() interface for eval/ifeval_test.py.
 
     Uses the same tiktoken GPT-2 tokenizer and autoregressive generation
     as the HuggingFace repo's extract_response / generate functions.
@@ -256,7 +253,7 @@ class ChronoGPTInstruct:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.eos_id = 50256
+        self.eos_id = 50256  # GPT-2 <|endoftext|>
         self.context_size = 1792
 
     @classmethod
@@ -297,6 +294,7 @@ class ChronoGPTInstruct:
         token_ids = self.tokenizer.encode(prompt, allowed_special={EOT})
         idx = torch.tensor([token_ids], dtype=torch.long, device=self.device)
 
+        # No KV cache: re-run the model on the last context_size tokens at every step
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.context_size:]
             logits = self.model(idx_cond)
@@ -311,6 +309,7 @@ class ChronoGPTInstruct:
                     logits,
                 )
 
+            # sample when temperature > 0, otherwise greedy
             if temperature > 0.0:
                 logits = logits / temperature
                 probs = torch.softmax(logits, dim=-1)
@@ -325,7 +324,7 @@ class ChronoGPTInstruct:
         # Decode only the generated portion
         generated_ids = idx[0, len(token_ids):].tolist()
         text = self.tokenizer.decode(generated_ids)
-        # Strip any trailing "### Response:" artifacts
+        # Remove any "### Response:" markers echoed by the model
         text = text.replace("### Response:", "").strip()
         return text
 
@@ -337,7 +336,7 @@ class ChronoGPTInstruct:
         top_k: int = None,
         start_idx: int = 0,
     ) -> List[str]:
-        """Generate responses for a list of prompts (for alpaca.py integration)."""
+        """Generate responses for a list of prompts (used by eval/ifeval_test.py)."""
         outputs = []
         total = start_idx + len(prompts)
         for i, prompt in enumerate(prompts):

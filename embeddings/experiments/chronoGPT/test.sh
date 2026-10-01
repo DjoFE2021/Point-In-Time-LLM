@@ -1,4 +1,8 @@
 #!/bin/bash -l
+# SLURM job: quick ChronoGPT embedding sanity check on 3 random articles (main.py --test).
+# Usage (from the repository root): mkdir -p logs && sbatch embeddings/experiments/chronoGPT/test.sh
+#   (base model: sbatch --export=ALL,MODEL_TYPE=base embeddings/experiments/chronoGPT/test.sh)
+# Paths are read from embeddings/experiments/.env; set VENV=/path/to/venv to use that environment (optional).
 #SBATCH --job-name=chronogpt-embed
 #SBATCH --partition=l40s
 #SBATCH --ntasks=1
@@ -6,46 +10,35 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=01:00:00
-#SBATCH --output=/home/jschwab/FinGPT/embeddings/chronoGPT/logs/%j.out
-#SBATCH --error=/home/jschwab/FinGPT/embeddings/chronoGPT/logs/%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
-module purge
-# Fill in exact names from: module spider python && module spider cuda
-module load python cuda 2>/dev/null || true
-
-VENV=/scratch/jschwab/venvs/chronogpt
-
-if [ ! -d "$VENV" ]; then
-    echo "Creating venv at $VENV ..."
-    python -m venv "$VENV"
-    "$VENV/bin/pip" install --upgrade pip
-    "$VENV/bin/pip" install torch tiktoken pandas huggingface_hub
+# Adjust module names for your cluster (see: module spider python / module spider cuda)
+if command -v module >/dev/null 2>&1; then
+    module purge
+    module load python cuda 2>/dev/null || true
 fi
 
-export PATH="$VENV/bin:$PATH"
+if [ -n "${VENV:-}" ]; then
+    export PATH="$VENV/bin:$PATH"
+fi
 
-SCRIPT_DIR=/home/jschwab/FinGPT/embeddings/chronoGPT
-cd "$SCRIPT_DIR"
-export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+# Run from the repository root (the directory sbatch was called from)
+REPO_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+cd "$REPO_DIR" || exit 1
+export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
-export HF_HOME=/scratch/jschwab/hf
-unset TRANSFORMERS_CACHE
+# Snapshots download to the default Hugging Face cache (honours HF_HOME) or CHRONOGPT_CACHE_DIR
 export PYTHONUNBUFFERED=1
-
-mkdir -p /home/jschwab/FinGPT/embeddings/chronoGPT/logs
-mkdir -p /scratch/jschwab/hf
-mkdir -p /scratch/jschwab/embeddings/chronogpt_instruct-v2
-mkdir -p /scratch/jschwab/embeddings/chronogpt_base-v2
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"
 echo "Started  : $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-MODEL_TYPE=instruct   # change to "base" for the base model
+MODEL_TYPE=${MODEL_TYPE:-instruct}  # "instruct" or "base"
 echo "Model type: $MODEL_TYPE"
 
-python3 main.py --model-type "$MODEL_TYPE" --test
-
+python3 embeddings/experiments/chronoGPT/main.py --model-type "$MODEL_TYPE" --test
 
 echo "Finished : $(date)"

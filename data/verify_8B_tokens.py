@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""
-Verify token counts in the 8B dataset files.
-Usage: python verify_8B_tokens.py [--dir /path/to/8B]
+"""Check that every monthly <YYYY-MM>.bin shard holds its expected token count (from its header).
+Expected count = --tokens-per-month x the month's gap multiplier from dump_coverage.py.
+
+Usage: python data/verify_8B_tokens.py --dir <SHARD_DIR> [--tokens-per-month 8000000000]
 """
 import os
 import argparse
 import numpy as np
 from dump_coverage import MONTH_MULTIPLIER
 def peek_header(filepath):
-    """Read the header and return token count."""
+    """Read the 256 x int64 shard header and return its magic, version and token count."""
     with open(filepath, "rb") as f:
         header = np.frombuffer(f.read(256 * 8), dtype=np.int64)
     magic, version, ntok = header[0], header[1], header[2]
@@ -28,11 +29,10 @@ def verify_files(output_dir: str, tokens_per_month: int = 8_000_000_000):
         month = fname.replace(".bin", "")
         fpath = os.path.join(output_dir, fname)
         
-        # Expected tokens
+        # Expected tokens (unknown months default to multiplier 1)
         info = MONTH_MULTIPLIER.get(month, {"multiplier": 1})
         expected_tokens = tokens_per_month * info["multiplier"]
-        
-        # Read header
+
         header = peek_header(fpath)
         actual_tokens = header["tokens"]
         file_size = os.path.getsize(fpath)
@@ -60,7 +60,7 @@ def verify_files(output_dir: str, tokens_per_month: int = 8_000_000_000):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dir", default="/mnt/seagate_8T/datasets/fineweb_pit/8B", help="Directory with .bin files")
+    parser.add_argument("--dir", required=True, help="Directory with the <YYYY-MM>.bin shards")
     parser.add_argument("--tokens-per-month", type=int, default=8_000_000_000, help="Base tokens per month")
     args = parser.parse_args()
     

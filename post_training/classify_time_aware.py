@@ -1,29 +1,6 @@
-"""
-Classify dataset rows as time-aware (references real-world events) or not.
-
-Reads from:   data/post_training_dataset/{name}/raw/data.jsonl
-Writes to:
-    data/post_training_dataset/{name}/classified/timeless/data.jsonl    (time_aware=0)
-    data/post_training_dataset/{name}/classified/time_aware/data.jsonl  (time_aware=1)
-
-Each row gets a "time_aware" key:
-    1 = references real-world events, people, or time-sensitive facts
-    0 = generic, hypothetical, mathematical, or coding content
-
-Uses GPT-5 Mini via OpenAI API for classification.
-
-Usage:
-    # Classify all datasets:
-    OPENAI_API_KEY=sk-... python post_training/classify_time_aware.py
-
-    # Classify specific dataset(s):
-    python post_training/classify_time_aware.py --only openai/gsm8k
-
-    # Adjust concurrency:
-    python post_training/classify_time_aware.py --workers 20
-
-    # Resume from where you left off (automatic, reads progress file):
-    python post_training/classify_time_aware.py
+"""Split raw post-training rows into timeless vs time-aware using an OpenAI model (default gpt-5-nano).
+Reads data/post_training_dataset/<name>/raw/data.jsonl, writes classified/{timeless,time_aware}/data.jsonl.
+Usage: OPENAI_API_KEY=... python post_training/classify_time_aware.py [--only NAME ...] [--workers N] [--force]
 """
 
 import argparse
@@ -42,8 +19,6 @@ ALL_DATASETS = [
     "ai2-adapt-dev/numinamath_tir_math_decontaminated",
     "ai2-adapt-dev/personahub_ifdata_manual_seed_v3_29980",
     "argilla/ifeval-like-data",
-    "allenai/llama-3.1-tulu-3-8b-preference-mixture",
-    "openai/gsm8k",
 ]
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -130,8 +105,7 @@ def classify_row(client, text, model, max_chars=4000):
                 {"role": "user", "content": text},
             ],
             max_completion_tokens=1500,
-            # NOTE: gpt-5-nano does NOT support temperature=0
-            #       (API returns 400: "Only the default (1) value is supported")
+            # No temperature=0: gpt-5-nano only accepts the default temperature (1)
         )
         answer = (resp.choices[0].message.content or "").strip()
         if answer in ("0", "1"):
@@ -264,11 +238,10 @@ def process_dataset(client, name, model, workers=10, force=False):
         print(f"  ❌ Raw file not found: {inp}")
         return
 
-    # Count total lines
     with open(inp, "r") as f:
         total_lines = sum(1 for _ in f)
 
-    # Check resume point
+    # Resume from the saved progress line unless --force
     start_line = 0
     if not force and os.path.exists(prog):
         with open(prog, "r") as f:
@@ -294,7 +267,7 @@ def process_dataset(client, name, model, workers=10, force=False):
                 return
             # Partial results with no progress file = ambiguous state
             print(f"  ❌ Found {existing:,d} output rows but no progress file.")
-            print(f"     Cannot safely resume. Use --force to re-classify from scratch.")
+            print("     Cannot safely resume. Use --force to re-classify from scratch.")
             return
 
     # Open output files (append if resuming, write if starting fresh)
@@ -305,7 +278,6 @@ def process_dataset(client, name, model, workers=10, force=False):
     f_time_aware = open(out_time_aware, mode, encoding="utf-8")
     f_errors = open(out_errors, mode, encoding="utf-8")
 
-    # Read all lines to classify
     with open(inp, "r", encoding="utf-8") as fin:
         lines = fin.readlines()
 
@@ -383,7 +355,7 @@ def process_dataset(client, name, model, workers=10, force=False):
     if error_count > 0:
         print(f"  ⚠️  {error_count:,d} errors logged → {out_errors}")
 
-    # ── Retry errors ──────────────────────────────────────────────
+    # Retry rows that failed (up to 3 passes)
     retry_errors(client, name, model, workers)
 
     # Write final progress (keep file so re-runs detect completion)
@@ -395,7 +367,7 @@ def process_dataset(client, name, model, workers=10, force=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Classify dataset rows as time-aware using GPT-5 Mini"
+        description="Classify dataset rows as time-aware or timeless with an OpenAI model"
     )
     parser.add_argument(
         "--only", nargs="+", default=None,
@@ -429,7 +401,7 @@ def main():
     datasets = sorted(datasets, key=lambda d: os.path.getsize(raw_path(d)) if os.path.exists(raw_path(d)) else float("inf"))
 
     print(f"{'═'*60}")
-    print(f"  Classifying time-aware rows (model: {MODEL})")
+    print(f"  Classifying time-aware rows (model: {args.model})")
     print(f"  Workers: {args.workers}")
     print(f"{'═'*60}")
 
@@ -437,7 +409,7 @@ def main():
         print(f"\n── {name}")
         process_dataset(client, name, model=args.model, workers=args.workers, force=args.force)
 
-    # ── Summary ───────────────────────────────────────────────────
+    # Per-dataset summary of classification results
     print(f"\n{'═'*60}")
     print("  Summary")
     print(f"{'═'*60}")

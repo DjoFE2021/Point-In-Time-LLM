@@ -1,14 +1,20 @@
+"""Load the JKP stock panel and monthly text embeddings, align them on (permno, date).
+
+Optionally residualizes embeddings per date on GPU; needs JKP_PANEL_PATH (env or .env).
+"""
 import gc
 import os
 import numpy as np
 import pandas as pd
 import torch
+from dotenv import load_dotenv
 
-import load_dotenv
+_ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+load_dotenv(_ENV_FILE)  # embeddings/experiments/.env; already-set variables take precedence
 
-load_dotenv.load_dotenv()  # Load environment variables from .env file
-
-_JKP_PATH = os.environ["JKP_PANEL_PATH"]
+_JKP_PATH = os.environ.get("JKP_PANEL_PATH")
+if not _JKP_PATH:
+    raise RuntimeError(f"JKP_PANEL_PATH is not set: add it to {_ENV_FILE} (see .env.example)")
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -47,6 +53,7 @@ def _resid_by_day_cuda(
 
 
 def load_jkp(file_path: str = _JKP_PATH, filter_small: bool = True) -> pd.DataFrame:
+    """Load the JKP panel indexed by (permno, date); filter_small keeps only large/mega caps."""
     df = pd.read_pickle(file_path)
     if filter_small:
         df = df[df.size_grp.isin(["large", "mega"])]
@@ -56,22 +63,19 @@ def load_jkp(file_path: str = _JKP_PATH, filter_small: bool = True) -> pd.DataFr
 
 
 def load_embeddings(file_path: str) -> pd.DataFrame:
-    if "dummy" in file_path:
-        return None
-
+    """Load monthly embeddings as a (permno, month-end date) × emb_i DataFrame."""
     df = pd.DataFrame(pd.read_pickle(file_path))
 
+    # Expand a column of embedding vectors into one column per dimension
     emb_col = df.columns[0] if isinstance(df, pd.DataFrame) else None
     if emb_col is not None and df[emb_col].dtype == object:
         arr = np.stack(df[emb_col].values)
         df = pd.DataFrame(arr, index=df.index,
                           columns=[f"emb_{i}" for i in range(arr.shape[1])])
 
-    if "mistral" in file_path:
-        df.index.names = ["date", "permno"]
-    else:
-        df.index.names = ["permno", "date"]
+    df.index.names = ["permno", "date"]
 
+    # Month labels (e.g. "YYYY-MM") → month-end timestamps
     date_level = df.index.get_level_values("date")
     if not pd.api.types.is_datetime64_any_dtype(date_level):
         eom_dates = pd.PeriodIndex(date_level, freq="M").to_timestamp("M")
@@ -97,6 +101,8 @@ def load_matched_ret_emb(
     filter_small: bool = True,
 ) -> pd.DataFrame:
     """
+    Return a (permno, date) DataFrame with r_1, size_grp and the embedding columns.
+
     residualize options:
       False / "none" — no residualization
       True  / "JKP+1" — JKP factors + intercept  (legacy default)
@@ -107,14 +113,6 @@ def load_matched_ret_emb(
 
     jkp_df = load_jkp(jkp_path, filter_small=filter_small)
     emb_df = load_embeddings(emb_path)
-
-    if emb_df is None:
-        rng = np.random.default_rng(seed=0)
-        emb_df = pd.DataFrame(
-            rng.standard_normal((len(jkp_df), emb_dim)),
-            index=jkp_df.index,
-            columns=[f"emb_{i}" for i in range(emb_dim)],
-        )
 
     emb_cols = list(emb_df.columns)
 
@@ -133,7 +131,7 @@ def load_matched_ret_emb(
     if residualize != "none":
         jkp_factor_cols = [c for c in jkp_df.columns if c not in meta_cols]
 
-        # Sort rows by date so day blocks are contiguous
+        # Sort rows by date so each date's rows form a contiguous block
         date_level = common_idx.names.index("date") if "date" in common_idx.names else 1
         date_vals = common_idx.get_level_values(date_level).to_numpy()
         sort_order = np.argsort(date_vals, kind="stable")
@@ -142,7 +140,7 @@ def load_matched_ret_emb(
         starts = np.r_[0, change]
         ends   = np.r_[change, len(common_idx)]
 
-        # Build regressors as plain float32 numpy — never keep as a DF
+        # Build regressors as plain float32 numpy arrays (not DataFrames) to save memory
         jkp_sub = jkp_df.loc[common_idx]
         parts = []
         if residualize in ("JKP", "JKP+1"):
@@ -163,6 +161,7 @@ def load_matched_ret_emb(
         del E_np, S_np
         gc.collect()
 
+        # Undo the date sort to restore common_idx order
         inv_order = np.argsort(sort_order)
         emb_sub = pd.DataFrame(E_resid[inv_order], index=common_idx, columns=emb_cols)
         del E_resid
@@ -174,6 +173,7 @@ def load_matched_ret_emb(
 
     result = pd.concat([meta_sub, emb_sub], axis=1)
 
+    # Optional cross-sectional demeaning / standardization per date
     if demean or standardize:
         dates = result.index.get_level_values("date")
         group_keys = [dates]
@@ -187,27 +187,3 @@ def load_matched_ret_emb(
             )
 
     return result
-
-if __name__ == "__main__":
-    
-    data1 = load_matched_ret_emb(
-        emb_path="/srv/datasets/DOW_JONES_NEWSWIRE/embeddings/chronogpt_base-right/embeddings_monthly.pkl",
-        jkp_path=_JKP_PATH,
-        emb_dim=15,
-        demean=False,
-        standardize=False,
-        residualize="1",
-        filter_small=False,
-    )
-    
-    data2 = load_matched_ret_emb(
-        emb_path="/srv/datasets/DOW_JONES_NEWSWIRE/embeddings/chronogpt_base-right/embeddings_monthly.pkl",
-        jkp_path=_JKP_PATH,
-        emb_dim=15,
-        demean=True,
-        standardize=False,
-        residualize=False,
-        filter_small=False,
-    )
-    
-    breakpoint()

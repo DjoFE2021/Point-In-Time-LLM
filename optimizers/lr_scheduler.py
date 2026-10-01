@@ -1,3 +1,6 @@
+"""Trapezoidal LR multiplier (linear warmup, constant, linear warmdown) for torch's LambdaLR."""
+
+
 class LRScheduler:
     """
     Linear warmup → constant → linear warmdown learning-rate schedule.
@@ -48,13 +51,9 @@ class LRScheduler:
         Returns
         -------
         float
-            Learning-rate multiplier in ``[0.0, 1.0]``.
-
-        Raises
-        ------
-        AssertionError
-            If ``it`` is greater than ``num_iterations``.
+            Learning-rate multiplier in ``[0.0, 1.0]``; ``0.01`` if ``it`` is greater than ``num_iterations``.
         """
+        # past the planned schedule (e.g. extra steps): keep a small constant multiplier
         if it > self.num_iterations:
             return 0.01
         # 1) linear warmup for warmup_iters steps

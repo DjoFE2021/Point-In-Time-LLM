@@ -1,19 +1,6 @@
-"""
-Tokenize the SFT mixture from local classified/timeless JSONL files.
-
-Reads data from:  data/post_training_dataset/*/*/classified/timeless/data.jsonl
-
-Usage:
-    # Tokenize the default mixture (code+math+IF) into a single dataset:
-    python post_training/sft_tokens.py
-
-    # Custom output dir and max length:
-    python post_training/sft_tokens.py --output-dir ./data/sft_tok --max-length 4096
-
-    # Cap a specific source:
-    python post_training/sft_tokens.py --cap "argilla/ifeval-like-data:300000"
-
-The saved dataset can then be loaded by tulu3_lora.py or similar for training.
+"""Tokenize the timeless SFT mixture (code, math, instruction-following) with the GPT-2 tokenizer.
+Reads data/post_training_dataset/<org>/<name>/classified/timeless/data.jsonl; output is used by sft.py.
+Usage: python post_training/sft_tokens.py [--output-dir DIR] [--max-length 2048] [--cap SRC:N ...]
 """
 
 import argparse
@@ -21,8 +8,7 @@ import json
 import os
 import random
 import re
-from collections import Counter, OrderedDict
-from pathlib import Path
+from collections import OrderedDict
 
 from datasets import Dataset
 from transformers import AutoTokenizer
@@ -30,7 +16,6 @@ from transformers import AutoTokenizer
 
 # ───────────── Source definitions ─────────────
 
-# Code & Math sources
 CODE_MATH_SOURCES = [
     "ai2-adapt-dev/evol_codealpaca_heval_decontaminated",
     "ai2-adapt-dev/personahub_code_v2_34999",
@@ -38,13 +23,13 @@ CODE_MATH_SOURCES = [
     "ai2-adapt-dev/tulu_v3.9_open_math_2_gsm8k_50k",
 ]
 
-# IF / eval-like sources
+# Instruction-following (IFEval-like) sources
 IF_SOURCES = [
     "ai2-adapt-dev/personahub_ifdata_manual_seed_v3_29980",
     "argilla/ifeval-like-data",
 ]
 
-# Default caps  (source_name → max_examples)
+# Default per-source caps: source name -> max examples (random subsample)
 DEFAULT_CAPS = {
     "argilla/ifeval-like-data": 300_000,
 }
@@ -52,7 +37,7 @@ DEFAULT_CAPS = {
 ALL_SOURCES = CODE_MATH_SOURCES + IF_SOURCES
 
 
-# ───────────── Chat formatting (matches tulu3_tokens.py) ─────────────
+# ───────────── Chat formatting ─────────────
 
 def format_messages(messages):
     """Format a list of {'role': ..., 'content': ...} dicts into plain text."""
@@ -93,7 +78,7 @@ def to_chat_text(record):
     return format_messages(record_to_messages(record))
 
 
-# ───────────── CJK filter (same as tulu3_tokens.py) ─────────────
+# ───────────── CJK filter ─────────────
 
 _CJK_RE = re.compile(
     r'[\u4e00-\u9fff'
@@ -141,7 +126,7 @@ def tokenize_example(text, tokenizer, max_length):
         padding=False,
         return_attention_mask=True,
     )
-    # Causal LM SFT: labels[i] = input_ids[i+1]
+    # Labels are pre-shifted (labels[i] = input_ids[i+1]); GPT.forward does not shift targets
     encoding["labels"] = encoding["input_ids"][1:] + [-100]
     return encoding
 
@@ -216,7 +201,7 @@ def main():
         n_english = len(filtered)
         cjk_removed = n_raw - n_english
 
-        # ── Apply cap ──
+        # ── Apply cap (random subsample, seed 42) ──
         if src in caps and len(filtered) > caps[src]:
             random.seed(42)
             random.shuffle(filtered)
@@ -263,7 +248,7 @@ def main():
     ds = Dataset.from_dict({"text": all_texts, "source": all_sources})
 
     # ── Tokenize ──
-    print(f"Loading tokenizer (gpt2) ...")
+    print("Loading tokenizer (gpt2) ...")
     tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -290,7 +275,7 @@ def main():
     keep_cols = {"input_ids", "attention_mask", "labels"}
     ds = ds.remove_columns([c for c in ds.column_names if c not in keep_cols])
 
-    # ── Drop over-length (safety) ──
+    # ── Drop over-length (safety check; truncation already caps length) ──
     before_len = len(ds)
     ds = ds.filter(
         lambda ex: len(ex["input_ids"]) <= args.max_length,

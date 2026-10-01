@@ -1,49 +1,34 @@
 #!/usr/bin/env python3
-"""
-Parallel FineWeb monthly shard builder.
+"""Tokenize FineWeb month by month (GPT-2 tokenizer) into pre-training shards <YYYY-MM>.bin.
+Each month gets tokens_per_month x its gap multiplier from dump_coverage.py; months can run in parallel.
 
-Usage:
-    # Process specific months
-    python cached_monthly_test_async.py --months 2013-05 2013-06 2013-12
-    
-    # Process a range by index (0-based)
-    python cached_monthly_test_async.py --start-idx 0 --end-idx 10
-    
-    # Process all months
-    python cached_monthly_test_async.py --all
+Usage: python data/get_train_set.py (--all | --months 2013-05 ... | --start-idx I [--end-idx J]) --output-dir <DIR>
 """
 import os
 import argparse
 import shutil
 import numpy as np
 import pyarrow.dataset as pds
-from tqdm import tqdm
-from datetime import datetime
 import time, requests
 from huggingface_hub import snapshot_download, list_repo_files
 from transformers import AutoTokenizer
 from transformers import PreTrainedTokenizer
 
 from dump_coverage import MONTH_MULTIPLIER
-# --- Configuration ---
+# Source dataset on the Hugging Face Hub
 HF_DATASET_REPO = "HuggingFaceFW/fineweb"
 HF_DATASET_REPO_TYPE = "dataset"
 
-# --- Helper: month difference ---
-def month_diff(m1: str, m2: str) -> int:
-    y1, mo1 = map(int, m1.split("-"))
-    y2, mo2 = map(int, m2.split("-"))
-    return (y2 - y1) * 12 + (mo2 - mo1)
-
+# snapshot_download with up to 4 attempts and exponential backoff on read timeouts
 def robust_snapshot_download(**kwargs):
     for attempt in range(4):
         try:
             return snapshot_download(**kwargs)
-        except requests.exceptions.ReadTimeout as e:
+        except requests.exceptions.ReadTimeout:
             if attempt == 3:
                 raise
             time.sleep(2 ** attempt)  # 1s, 2s, 4s
-# --- Streaming Version: Writes directly to disk, O(batch) memory ---
+# Downloads parquet files in small batches and streams tokens to disk (O(batch) memory)
 def process_snapshot_month_batched_streaming(
     config: str,
     year_month: str,
@@ -54,8 +39,8 @@ def process_snapshot_month_batched_streaming(
     dtype=np.uint16,
     batch_size_files: int = 50
 ):
-    """Same as process_snapshot_month_batched but streams tokens to disk."""
-    # Compute date range
+    """Tokenize one month of a FineWeb dump and stream the tokens to a .bin shard on disk."""
+    # Half-open date range [first day of month, first day of next month)
     year, month = map(int, year_month.split("-"))
     if month == 12:
         next_year, next_month = year + 1, 1
@@ -77,7 +62,7 @@ def process_snapshot_month_batched_streaming(
     print(f"🔍 Found {len(parquet_files)} parquet files for {config}. Processing {year_month} (streaming)...")
 
     with open(output_path, "wb") as f:
-        # Write placeholder header (we'll update token count at the end)
+        # 256 x int64 header; the token count (header[2]) is filled in at the end
         header = np.zeros(256, dtype=np.int64)
         header[0], header[1] = 20240520, 1  # magic, version (count will be updated)
         f.write(header.tobytes())
@@ -115,11 +100,12 @@ def process_snapshot_month_batched_streaming(
                     if not toks:
                         continue
                     rem = target_tokens - count
+                    # Truncate the last document so the shard ends at exactly target_tokens (EOS included)
                     if len(toks) >= rem:
                         toks = toks[: max(0, rem - 1)]
                     toks.append(eos)
                     
-                    # Write tokens directly to file (streaming!)
+                    # Append this document's tokens directly to the file
                     f.write(np.array(toks, dtype=dtype).tobytes())
                     count += len(toks)
                     
@@ -196,7 +182,7 @@ if __name__ == "__main__":
     group.add_argument("--all", action="store_true", help="Process all months")
     
     parser.add_argument("--end-idx", type=int, help="End index (exclusive) for month range")
-    parser.add_argument("--output-dir", default="/home/tengandrea/fineweb_pit/8B", help="Output directory")
+    parser.add_argument("--output-dir", required=True, help="Directory for the <YYYY-MM>.bin shards")
     parser.add_argument("--tokens-per-month", type=int, default=8_000_000_000, help="Base tokens per month (default: 8B)")
     
     default_cache = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
@@ -204,7 +190,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Get sorted list of all months
+    # All months in chronological order; --start-idx/--end-idx index into this list
     all_months = sorted(MONTH_MULTIPLIER.keys())
     
     # Determine which months to process

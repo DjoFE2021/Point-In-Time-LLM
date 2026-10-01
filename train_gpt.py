@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""
-GPT Training Script with CLI and Monthly Checkpointing.
+"""Pre-train a GPT model on monthly FineWeb shards, saving a checkpoint whenever a month of data ends.
+The training loop is adapted from modded-nanogpt (MIT licensed; see THIRD_PARTY_NOTICES.md).
 
 Usage:
-    # Normal training with 1B model
-    torchrun --nproc_per_node=8 train_gpt.py --model 1B
-    
-    # Dry-run with tiny model
-    torchrun --nproc_per_node=1 train_gpt.py --dry-run
-    
-    # Resume from checkpoint
-    torchrun --nproc_per_node=8 train_gpt.py --model 1B --resume /path/to/checkpoint.pt
+    torchrun --nproc_per_node=8 train_gpt.py --model 1B --data-dir "<TRAIN_DIR>/*.bin" --val-dir "<VAL_DIR>/*.bin"
+    # resume: the start step is parsed from "step=N" in the checkpoint filename
+    torchrun --nproc_per_node=8 train_gpt.py --model 1B --resume /path/to/<month>_step=N_checkpoint.pt
 """
 import os
 import math
@@ -32,10 +27,10 @@ from models.GPT import GPT
 from models.GPTConfig import GPT2_1B, GPT2_4B
 from optimizers.MuON import Muon
 from optimizers.lr_scheduler import LRScheduler
-from dataloaders.DDP import DistributedDataLoader, save_checkpoint
+from dataloaders.DDP import DistributedDataLoader
 from training.Hyperparams import CSCS_60GPU, CSCS_160GPU_2K
 
-from utils.checkpoint_loading import (
+from training.checkpoint_loading import (
     load_checkpoint_to_model,
     load_checkpoint_to_optimizers,
     load_checkpoint_to_schedulers,
@@ -52,11 +47,6 @@ def parse_args():
         choices=["1B", "4B"],
         default="1B",
         help="Model size: 1B (~1.5B params), 4B (~4B params)"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Use tiny model for testing (equivalent to --model 4B)"
     )
     parser.add_argument(
         "--resume",
@@ -81,19 +71,19 @@ def parse_args():
         "--data-dir",
         type=str,
         default=None,
-        help="Override training data directory from config"
+        help='Glob pattern of the training shards, e.g. "<dir>/2013-*.bin" (overrides the config)'
     )
     parser.add_argument(
         "--val-dir",
         type=str,
         default=None,
-        help="Override validation data directory from config"
+        help='Glob pattern of the validation shards, e.g. "<dir>/fineweb_val_*.bin" (overrides the config)'
     )
     parser.add_argument(
         "--total-tokens",
         type=int,
         default=None,
-        help="Total tokens for entire training run (for proper LR scheduling across months)"
+        help="Total tokens of the whole multi-year run; pass the same value to every yearly run so one LR schedule spans all years"
     )
     
     return parser.parse_args()
@@ -126,7 +116,7 @@ def save_monthly_checkpoint(
     schedulers: list,
     code: str,
 ):
-    """Save checkpoint at end of month."""
+    """Save model, optimizer and scheduler states for `month` to <output_dir>/<month>_step=<step>_checkpoint.pt."""
     os.makedirs(output_dir, exist_ok=True)
     
     checkpoint = {
@@ -146,6 +136,7 @@ def save_monthly_checkpoint(
 
 
 def main():
+    """Set up DDP, data, model and optimizers, then run the training loop."""
     args = parse_args()
     
     # Get hyperparameters
@@ -158,10 +149,9 @@ def main():
     if args.val_dir:
         hparams.input_val_bin = args.val_dir
     
-    # Override state_dict with resume path and extract start_step from checkpoint
+    # Resume: load weights from --resume and take start_step from its filename
     if args.resume:
         hparams.state_dict = args.resume
-        # Load checkpoint to get resume step
         import re
         # Try to extract step from filename (format: *_step=NNNN_*.pt)
         match = re.search(r'step=(\d+)', args.resume)
@@ -179,6 +169,8 @@ def main():
     torch.cuda.set_device(device)
     print(f"using device: {device}")
     master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+    if master_process:
+        os.makedirs(args.output_dir, exist_ok=True)  # checkpoints (from step 0 on) are written here
 
     # Store per-device batch size and sequence length under convenient variables
     B, T = hparams.device_batch_size, hparams.sequence_length
@@ -191,19 +183,29 @@ def main():
     assert hparams.batch_size % (B * ddp_world_size) == 0
     train_accumulation_steps = hparams.batch_size // (B * ddp_world_size)
 
-    # Instantiate the DistributedDataLoader for the training and validation
-    # Create callback that uses CLI output-dir
-    def on_shard_advance(model, dataloader, optimizer, scheduler):
-        save_checkpoint(model, dataloader, optimizer, scheduler, save_dir=args.output_dir)
-    
+    # Data loaders. The train loader calls on_month_end on every rank when a month's data runs out,
+    # before any rank reads the next month, so the saved weights have seen no next-month data.
+    # `step` is the training-loop variable: the number of optimizer steps applied so far.
+    def on_month_end(model, dataloader, optimizers, schedulers):
+        if master_process:
+            save_monthly_checkpoint(
+                output_dir=args.output_dir,
+                month=dataloader.current_file_month(),
+                step=step,
+                model=model.module,  # unwrap DDP
+                optimizers=optimizers,
+                schedulers=schedulers,
+                code=code,
+            )
+
     train_loader = DistributedDataLoader(
-        hparams.input_bin, B, T, ddp_rank, ddp_world_size, on_shard_advance, hparams.skip_files
+        hparams.input_bin, B, T, ddp_rank, ddp_world_size, on_month_end, hparams.skip_files
     )
     val_loader = DistributedDataLoader(
         hparams.input_val_bin, B, T, ddp_rank, ddp_world_size, None, None
     )
     if master_process:
-        print(f"Model: {args.model} (dry-run: {args.dry_run})")
+        print(f"Model: {args.model}")
         print(
             f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files"
         )
@@ -229,11 +231,11 @@ def main():
         del ckpt["model"]
         print("checkpoint loaded in models")
 
-    # NOW WE SEND TO CUDA
+    # Move the model to GPU (the checkpoint was loaded on CPU)
     model = model.cuda()
 
     if hasattr(config, "coordinate_descent_tuning"):
-        config.coordinate_descent_tuning = True  # suggested by @Chillee
+        config.coordinate_descent_tuning = True  # extra Inductor kernel autotuning (slower compile, faster steps)
     model = torch.compile(model)
 
     # Wrap the model in the DDP container for multi-GPU training
@@ -268,7 +270,7 @@ def main():
         optimizers = load_checkpoint_to_optimizers(optimizers, ckpt)
         print("checkpoint loaded in optimizers")
 
-    # Compute the number of iterations for THIS file (used for training loop)
+    # Number of training steps over all selected shard files
     file_iterations = int(
         math.ceil(train_loader.ntok_total / hparams.batch_size / hparams.sequence_length)
     )
@@ -281,11 +283,12 @@ def main():
         if master_process:
             print(f"LR schedule based on {args.total_tokens:,} total tokens → {total_iterations:,} total steps")
     else:
-        # Fallback: just use current file tokens
+        # Fallback: schedule over the selected shard files only
         total_iterations = file_iterations + hparams.start_step
         if master_process:
             print(f"⚠️  No --total-tokens specified, using current file only ({total_iterations:,} steps)")
     
+    # LR decays linearly to zero over the second half of the full run
     warmdown_iters = total_iterations // 2
     num_iterations = file_iterations
     if hparams.state_dict is not None:
@@ -311,12 +314,13 @@ def main():
             for opt in optimizers
         ]
 
+    # Sanity print: current LRs and warmdown length (useful when resuming)
     for sched in schedulers:
         print(sched.get_lr())
 
     print(warmdown_iters)
 
-    # Let's start the Logging
+    # Logging (master process only)
     if master_process:
         run_id = str(uuid.uuid4())
         logdir = "logs/%s/" % run_id
@@ -339,9 +343,6 @@ def main():
             f.write(f"{result.stdout}\n")
             f.write("=" * 100 + "\n")
 
-    # Track current month for monthly checkpointing
-    current_month = train_loader.current_file_month() if hasattr(train_loader, 'current_file_month') else None
-    
     training_time_ms = 0
     # start the clock
     torch.cuda.synchronize()
@@ -351,25 +352,8 @@ def main():
     
     for step in range(hparams.start_step, hparams.start_step + num_iterations + 1):
         last_step = step == (hparams.start_step + num_iterations)
-        
-        # Check for month transition and save checkpoint
-        if hasattr(train_loader, 'current_file_month'):
-            new_month = train_loader.current_file_month()
-            if new_month != current_month and current_month is not None and master_process:
-                # Month changed - save checkpoint for completed month
-                save_monthly_checkpoint(
-                    output_dir=args.output_dir,
-                    month=current_month,
-                    step=step,
-                    model=raw_model,
-                    optimizers=optimizers,
-                    schedulers=schedulers,
-                    code=code,
-                )
-            current_month = new_month
-        
-        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-        # Use session-relative step count for timing (handles resume correctly)
+
+        # Exclude the first 10 (slower) steps of this session from the timing
         session_step = step - hparams.start_step
         if session_step == 10:
             training_time_ms = 0
@@ -469,24 +453,12 @@ def main():
                     f"step:{step+1}/{num_iterations + hparams.start_step} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n"
                 )
 
-    # Save final checkpoint for last month
-    if master_process and current_month is not None:
-        save_monthly_checkpoint(
-            output_dir=args.output_dir,
-            month=current_month,
-            step=step,
-            model=raw_model,
-            optimizers=optimizers,
-            schedulers=schedulers,
-            code=code,
-        )
-
     if master_process:
         print(
             f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB"
         )
 
-    # clean up nice
+    # shut down the process group
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

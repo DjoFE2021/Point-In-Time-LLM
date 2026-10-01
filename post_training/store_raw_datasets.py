@@ -1,30 +1,6 @@
-"""
-Download all HuggingFace datasets used in training.sh and save as JSONL.
-
-Saves each dataset to:
-    data/post_training_dataset/{hf_path}/raw/data.jsonl
-
-Datasets:
-  SFT subsets (from allenai/tulu-3-sft-mixture):
-    - ai2-adapt-dev/evol_codealpaca_heval_decontaminated
-    - ai2-adapt-dev/personahub_code_v2_34999
-    - ai2-adapt-dev/tulu_v3.9_open_math_2_gsm8k_50k
-    - ai2-adapt-dev/numinamath_tir_math_decontaminated
-    - ai2-adapt-dev/personahub_ifdata_manual_seed_v3_29980
-  Standalone:
-    - argilla/ifeval-like-data
-    - allenai/llama-3.1-tulu-3-8b-preference-mixture
-    - openai/gsm8k
-
-Usage:
-    # Download all datasets:
-    python post_training/parse_timeless_prompt.py
-
-    # Download specific dataset(s) only:
-    python post_training/parse_timeless_prompt.py --only openai/gsm8k argilla/ifeval-like-data
-
-    # Force re-download even if file exists:
-    python post_training/parse_timeless_prompt.py --force
+"""Download the post-training datasets from HuggingFace, drop non-English rows, save as JSONL.
+Writes data/post_training_dataset/<org>/<name>/raw/data.jsonl (5 Tulu-3 SFT subsets + argilla/ifeval-like-data).
+Usage: python post_training/store_raw_datasets.py [--only NAME ...] [--force] [--max-length N]
 """
 
 import argparse
@@ -36,12 +12,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 
-# ── Dataset registry ─────────────────────────────────────────────────
-# Each entry: (output_path, parent_dataset, hf_config, source_filter)
-#   - output_path:    key under data/post_training_dataset/
-#   - parent_dataset: HuggingFace dataset ID to load
-#   - hf_config:      config/subset name passed to load_dataset (or None)
-#   - source_filter:  value of "source" column to filter on (or None = keep all)
+# ── Dataset registry (SFT subsets are filtered from the Tulu-3 mixture by "source") ──
 
 TULU_SFT_MIXTURE = "allenai/tulu-3-sft-mixture"
 
@@ -56,9 +27,6 @@ SFT_SUBSETS = [
 STANDALONE_DATASETS = [
     # (output_path, hf_dataset_id, hf_config)
     ("argilla/ifeval-like-data", "argilla/ifeval-like-data", None),
-    ("allenai/llama-3.1-tulu-3-8b-preference-mixture",
-     "allenai/llama-3.1-tulu-3-8b-preference-mixture", None),
-    ("openai/gsm8k", "openai/gsm8k", "main"),
 ]
 
 BASE_DIR = "./data/post_training_dataset"
@@ -123,7 +91,7 @@ def extract_text(row: dict) -> str:
             for msg in row[key]:
                 if isinstance(msg, dict):
                     parts.append(msg.get("content", ""))
-    # argilla: instruction + response
+    # Flat text fields (argilla instruction/response, GSM8K question/answer, ...)
     for key in ("instruction", "response", "question", "answer", "prompt", "completion"):
         if key in row:
             parts.append(str(row[key]))
@@ -217,7 +185,7 @@ def main():
     parser.add_argument(
         "--only", nargs="+", default=None,
         help="Download only these dataset(s), by name "
-             "(e.g. openai/gsm8k ai2-adapt-dev/personahub_code_v2_34999)",
+             "(e.g. argilla/ifeval-like-data ai2-adapt-dev/personahub_code_v2_34999)",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -271,7 +239,7 @@ def main():
             sft_ds = load_dataset(TULU_SFT_MIXTURE, split="train")
             print(f"  Raw examples: {len(sft_ds):,d}")
 
-            # Show all source counts for reference
+            # Per-source counts, used to suggest names when a subset matches nothing
             counts = Counter(sft_ds["source"])
 
             for subset_name in sft_todo:
@@ -285,7 +253,7 @@ def main():
                 print(f"   {len(filtered):,d} examples")
 
                 if len(filtered) == 0:
-                    print(f"   ⚠️  No examples matched! Skipping.")
+                    print("   ⚠️  No examples matched! Skipping.")
                     # Show closest matches
                     for src in sorted(counts.keys()):
                         if subset_name.split("/")[-1][:10] in src:
@@ -329,7 +297,6 @@ def main():
         out = output_path(name)
         if os.path.exists(out):
             size_mb = os.path.getsize(out) / (1024 * 1024)
-            # Count lines
             with open(out, "r") as f:
                 n_lines = sum(1 for _ in f)
             print(f"  ✅ {name:<58s}  {n_lines:>8,d} rows  {size_mb:>7.1f} MB")

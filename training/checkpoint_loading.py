@@ -1,3 +1,7 @@
+"""Helpers for resuming pre-training (train_gpt.py --resume).
+
+Restore model weights, optimizer states and LR schedulers from a train_gpt.py checkpoint.
+"""
 import torch
 
 from collections import OrderedDict
@@ -8,27 +12,26 @@ from optimizers.lr_scheduler import LRScheduler
 def load_checkpoint_to_model(
     ckpt : dict,
     model : GPT) -> GPT:
+    """Load ckpt["model"] into `model`, stripping DDP / torch.compile key prefixes as needed."""
     
     raw_sd = ckpt["model"]
     new_sd = OrderedDict()
     for k, v in raw_sd.items():
-        # remove 'module.' if present
+        # strip the DDP 'module.' prefix if present
         name = k.replace("module.", "")
-        # or remove 'model.' if your dict was nested: name = name.replace("model.", "")
         new_sd[name] = v
         
     ckpt["model"] = new_sd
     
-    #Load the weights in the model
+    # Try the stripped names; on failure also strip torch.compile's '_orig_mod.' prefix
     try:
         model.load_state_dict(ckpt["model"])
     except:
         new_sd = OrderedDict()
         for k, v in raw_sd.items():
-            # remove 'module.' if present
+            # strip 'module._orig_mod.' (DDP + compile) or bare '_orig_mod.' prefixes
             name = k.replace("module._orig_mod.", "").replace("_orig_mod.", "")
 
-            # or remove 'model.' if your dict was nested: name = name.replace("model.", "")
             new_sd[name] = v
         
         ckpt["model"] = new_sd
@@ -63,16 +66,16 @@ def load_checkpoint_to_optimizers(optimizers,
 
 def build_scheduler_at_step(scheduler_cls, optimizer, last_epoch, **kwargs):
     """
-    Recreate a scheduler as if it has already advanced `step_idx` times.
+    Recreate a scheduler as if it has already advanced `last_epoch` times.
 
     Args:
         scheduler_cls: a class from torch.optim.lr_scheduler (e.g., CosineAnnealingLR)
         optimizer: the optimizer the scheduler controls
-        step_idx (int): number of scheduler steps that already happened
+        last_epoch (int): number of scheduler steps that already happened
         **kwargs: the usual scheduler constructor kwargs (T_max, milestones, etc.)
 
     Returns:
-        A scheduler ready to continue from step_idx.
+        A scheduler ready to continue from last_epoch (None if the class takes no `last_epoch`).
     """
     # Most _LRScheduler subclasses accept last_epoch
     if "last_epoch" in scheduler_cls.__init__.__code__.co_varnames:
@@ -88,6 +91,9 @@ def load_checkpoint_to_schedulers(
     warmup_iters   : int):
     """
     Restore a list of LR schedulers from a checkpoint.
+
+    If the checkpoint has no scheduler states, build fresh LambdaLR schedulers
+    positioned at `scheduler_step` instead.
     """
     sch_states = checkpoint.get("schedulers", None)
     

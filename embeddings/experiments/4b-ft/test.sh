@@ -1,4 +1,7 @@
 #!/bin/bash -l
+# SLURM job: quick one-GPU sanity check of the 4B-FT embedding pipeline (main.py --test).
+# Usage (from the repository root): mkdir -p logs && sbatch embeddings/experiments/4b-ft/test.sh
+# Paths are read from embeddings/experiments/.env; set VENV=/path/to/venv to use that environment (optional).
 #SBATCH --job-name=4b-ft-embed-test
 #SBATCH --partition=l40s
 #SBATCH --ntasks=1
@@ -6,27 +9,30 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=46G
 #SBATCH --time=01:00:00
-#SBATCH --output=/home/jschwab/FinGPT/embeddings/4b-ft/logs/%j.out
-#SBATCH --error=/home/jschwab/FinGPT/embeddings/4b-ft/logs/%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
-module purge
-module load python cuda 2>/dev/null || true
+# Load modules where the cluster has them (adjust names for your cluster)
+if command -v module >/dev/null 2>&1; then
+    module purge
+    module load python cuda 2>/dev/null || true
+fi
 
-VENV=/scratch/jschwab/venvs/chronogpt
-export PATH="$VENV/bin:$PATH"
+if [ -n "${VENV:-}" ]; then
+    export PATH="$VENV/bin:$PATH"
+fi
 
-SCRIPT_DIR=/home/jschwab/FinGPT/embeddings/4b-ft
-cd "$SCRIPT_DIR"
-export PYTHONPATH="/home/jschwab/FinGPT:$PYTHONPATH"
+# Run from the repository root (the directory sbatch was called from)
+REPO_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+cd "$REPO_DIR" || exit 1
+export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
-
-mkdir -p /home/jschwab/FinGPT/embeddings/4b-ft/logs
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"
 echo "Started  : $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-python3 main.py --test
+python3 embeddings/experiments/4b-ft/main.py --test
 
 echo "Finished : $(date)"

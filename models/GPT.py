@@ -1,7 +1,10 @@
+"""GPT model used for all PIT checkpoints: RoPE, QK-norm, squared-ReLU MLP, tied embeddings.
+
+Adapted from modded-nanogpt (MIT licensed; see THIRD_PARTY_NOTICES.md); model sizes are defined in models/GPTConfig.py.
+"""
 import torch
 from torch import nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 
 
 class Rotary(torch.nn.Module):
@@ -198,7 +201,7 @@ class MLP(nn.Module):
             Output tensor of shape ``(B, T, C)``.
         """
         x = self.c_fc(x)
-        x = F.relu(x).square()  # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.relu(x).square()  # squared ReLU (arxiv.org/abs/2109.08668), ~1-2% better than GELU
         x = self.c_proj(x)
         return x
 
@@ -244,8 +247,7 @@ class Block(nn.Module):
         return x
 
 
-# -----------------------------------------------------------------------------
-# The main GPT-2 model
+# Full model: token embedding -> transformer blocks -> RMSNorm -> tied LM head
 
 class GPT(nn.Module):
     """
@@ -272,7 +274,7 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.gradient_checkpointing = False  # Disabled by default
+        self.gradient_checkpointing = False  # set True to trade compute for memory (used by SFT)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -295,6 +297,9 @@ class GPT(nn.Module):
         return_logits : bool, optional
             Whether to return logits. If ``False``, returns ``None`` for logits
             to save memory/bandwidth, by default True.
+        full_sequence : bool, optional
+            Return logits for every position and no loss (``targets`` is ignored),
+            by default False.
 
         Returns
         -------
@@ -304,7 +309,6 @@ class GPT(nn.Module):
               or ``(B, 1, vocab_size)`` during inference-time optimization, else ``None``.
             - ``loss`` is a scalar tensor when ``targets`` are provided, else ``None``.
         """
-        # forward the GPT model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         
         for block in self.transformer.h:
@@ -316,12 +320,13 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         
         if full_sequence:
+            # logits for every position, no loss (lm-eval scoring, embeddings)
             logits = self.lm_head(x)
             logits = logits.float()
             loss   = None
 
         elif targets is not None:
-            # if we are given some desired targets also calculate the loss
+            # training: full logits plus cross-entropy loss (targets of -100 are ignored)
             logits = self.lm_head(x)
             logits = logits.float()  # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
@@ -331,16 +336,18 @@ class GPT(nn.Module):
             logits = logits.float()  # use tf32/fp32 for logits
             loss = None
 
-        # there are performance reasons why not returning logits is prudent, if not needed
+        # drop logits when not needed to save memory/bandwidth
         if not return_logits:
             logits = None
 
         return logits, loss
     
     def get_input_embeddings(self):
+        """Return the token embedding module (HF-style accessor)."""
         return self.transformer.wte
 
     def forward_from_embeds(self, inputs_embeds, labels=None, return_logits=False):
+        """Like ``forward`` but starts from precomputed ``(B, T, C)`` embeddings; returns ``(logits, loss)``."""
         x = inputs_embeds
         for block in self.transformer.h:
             x = block(x)

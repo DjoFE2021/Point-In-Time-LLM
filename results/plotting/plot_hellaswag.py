@@ -1,20 +1,17 @@
-"""
-Plot HellaSwag accuracy over time — filtered to dates with full CSR results.
-Similar to plot_hellaswag.py but with fewer data points (only evaluated checkpoints).
+"""Plot HellaSwag accuracy of the monthly PIT-1.5B/4B checkpoints against fixed baseline lines.
+Only months that also have a full CSR results CSV (results/YYYY-MM_step=*.csv) are shown.
 
-Usage:
-    python plots/plot_csr_benchmarks.py
+Usage: python results/plotting/plot_hellaswag.py   (from the repo root; writes results/plots/csr_benchmarks.*)
 """
 
 import csv
 import glob
 import os
 import re
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ── Scientific paper style ─────────────────────────────────────
+# Paper-style matplotlib defaults
 plt.style.use('seaborn-v0_8-paper')
 plt.rcParams.update({
     'font.family': 'serif',
@@ -62,7 +59,7 @@ def main():
     for d in sorted(csr_dates):
         print(f"  {d}")
 
-    # ── Load and filter HellaSwag time series ──
+    # Load the HellaSwag time series and keep only months with CSR results
     results_1b = pd.read_csv("results/hellaswag_1B.csv")
     results_1b["date"] = pd.to_datetime(results_1b["date"], format="%Y-%m")
     results_1b = results_1b[results_1b["date"].isin(csr_dates_dt)]
@@ -73,13 +70,12 @@ def main():
     results_4b = results_4b[results_4b["date"].isin(csr_dates_dt)]
     results_4b = results_4b.sort_values("date").reset_index(drop=True)
     
-    # ── Merge dates for x-axis ──
+    # One evenly spaced x-axis tick per CSR month
     all_dates = sorted(csr_dates_dt)
 
-    # ── Plot ────────────────────────────────────────────
     fig, ax1 = plt.subplots(figsize=(12, 6))
 
-    # Token distribution (if available)
+    # Token distribution from dump_coverage.py (loaded if present, not plotted)
     tokens = None
     if os.path.exists("data/tokens_dist.csv"):
         tokens = pd.read_csv("data/tokens_dist.csv")
@@ -106,13 +102,13 @@ def main():
     ax1.set_ylabel("HellaSwag Accuracy (%)")
     ax1.set_ylim(0, 100)
 
-    # Baselines
+    # Baselines drawn as horizontal lines: (accuracy %, color, line style, legend label)
     baselines = [
         (77,   "#2ca02c", "-",  r"Gemma3-4B $\bf{(77\%)}$"),
         (76,   "#17becf", "-",  r"LLaMA-7B $\bf{(76\%)}$"),
         (62.3, "#ff7f0e", "-",  r"Gemma3-1B $\bf{(62.3\%)}$"),
         (53.2, "#e377c2", "-", r"DatedGPT $\bf{(53.2\%)}$"),
-        (48.0, "#d62728", "-",  r"GPT2-XL-1.5B $\bf{(50.9\%)}$"),
+        (50.9, "#d62728", "-",  r"GPT2-XL-1.5B $\bf{(50.9\%)}$"),
         (44,   "#8c564b", "-",  r"ChronoGPT (2024) $\bf{(44\%)}$"),
         (25,   "#7f7f7f", "--", r"Random Guess $\bf{(25\%)}$"),
     ]
@@ -124,7 +120,7 @@ def main():
     ax1.set_xticklabels([d.strftime("%Y-%m") for d in all_dates], rotation=45, ha="right")
     ax1.set_xlabel("Date")
 
-    # Legend
+    # Legend outside the axes, on the right
     legend = ax1.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
                         frameon=True, fancybox=True, shadow=True,
                         edgecolor='#cccccc', facecolor='white')
@@ -139,6 +135,7 @@ def main():
     plt.tight_layout()
     plt.subplots_adjust(right=0.68)
 
+    os.makedirs("results/plots", exist_ok=True)
     plt.savefig("results/plots/csr_benchmarks.png", dpi=300, bbox_inches='tight', facecolor='white')
     plt.savefig("results/plots/csr_benchmarks.pdf", bbox_inches='tight', facecolor='white')
     print("\n✅ Saved results/plots/csr_benchmarks.png and .pdf")

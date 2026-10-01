@@ -1,10 +1,13 @@
+"""Load year-end ChronoGPT base/instruct snapshots (1999-2024) from the Hugging Face Hub."""
 import importlib.util
+import os
 import sys
 import tiktoken
 from datetime import date
 from huggingface_hub import hf_hub_download
 
-CACHE_DIR = "/scratch/jschwab/hf"
+# Hugging Face cache: the default one (honours HF_HOME) unless CHRONOGPT_CACHE_DIR is set
+CACHE_DIR = os.environ.get("CHRONOGPT_CACHE_DIR") or None
 _AVAILABLE_YEARS = range(1999, 2025)
 
 # Model-type registry: maps model_type → (repo pattern, class filename, class name)

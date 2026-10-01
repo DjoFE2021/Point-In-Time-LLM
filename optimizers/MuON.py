@@ -1,13 +1,18 @@
+"""Muon optimizer: momentum SGD with Newton-Schulz-orthogonalized 2D updates, split across DDP ranks.
+
+Adapted from modded-nanogpt (MIT licensed; see THIRD_PARTY_NOTICES.md); train_gpt.py uses it for the transformer blocks (AdamW for the LM head).
+"""
 import torch
 import torch.distributed as dist
 
 def zeropower_via_svd(G, steps=None):
+    """Exact orthogonalization U V^T via SVD (slow reference backend; ``steps`` is unused)."""
     U, S, V = G.svd()
     return U @ V.T
 
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    """
+    r"""
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
@@ -56,6 +61,7 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+        rank, world_size: This process's rank and the number of ranks splitting the orthogonalization work.
     """
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
                  backend='newtonschulz5', backend_steps=5,
@@ -66,6 +72,7 @@ class Muon(torch.optim.Optimizer):
         self.world_size = world_size
 
     def step(self):
+        """Each rank updates momentum and orthogonalizes its share of the params; then all ranks apply every update."""
 
         for group in self.param_groups:
 
@@ -78,7 +85,7 @@ class Muon(torch.optim.Optimizer):
             updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
             curr_idx = 0
             for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+                # round-robin: this rank orthogonalizes every world_size-th parameter
                 if i % self.world_size == self.rank:
                     g = p.grad
                     if g is None:
@@ -95,7 +102,7 @@ class Muon(torch.optim.Optimizer):
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
 
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            # sum across ranks (default process group) so every rank gets all updates (unowned slots are zero)
             dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             # deserialize and apply updates

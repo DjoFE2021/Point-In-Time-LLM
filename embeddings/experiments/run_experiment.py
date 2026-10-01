@@ -1,14 +1,18 @@
+"""Out-of-sample ridge max-Sharpe regression (MSRR) on portfolios built from stock text embeddings.
+
+Compares models' OOS Sharpe per ridge z, the z-average and LOO-chosen z; writes CSVs and plots.
+Usage: python embeddings/experiments/run_experiment.py  (JKP_PANEL_PATH, EMBEDDINGS_DIR set in .env)
+"""
 import os
 import sys
 
-# ensure the script's directory is on the path so utils imports work
-# regardless of where the script is invoked from
+# Put the script's directory on sys.path so `utils` imports work from any cwd
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-import load_dotenv
-load_dotenv.load_dotenv(os.path.join(_SCRIPT_DIR, ".env"))
+from dotenv import load_dotenv
+load_dotenv(os.path.join(_SCRIPT_DIR, ".env"))
 
 import numpy as np
 import pandas as pd
@@ -24,6 +28,7 @@ from utils.constants import DEFAULT_SHRINKAGE_GRID
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Experiment configuration; MODELS are subdirectory names under EMBEDDINGS_DIR
 MODELS          = ["chronogpt_base-right", "chronogpt_instruct-right", "PIT-4B-right", "PIT-4B-FT-right", "4b-full", "4b-ft-full"]
 MODEL_LABELS    = ["ChronoGPT-base", "ChronoGPT-instruct", "PIT-4B", "PIT-4B-FT", "4B-Full", "4B-FT-Full"]
 MODEL_COLORS    = ["#10b981", "#f59e0b", "#2563eb", "#9ca3af", "#8b5cf6", "#ec4899"]   # green, amber, blue, light grey, purple, pink
@@ -34,10 +39,7 @@ PORTFOLIOS      = ["linear"]
 PORTFOLIO_TITLES = {"linear" : "Linear", "random_feature": "Random Features"}
 N_RANDOM_FEAT   = 50
 FILTER_SMALL    = False
-# Residualization against which regressors before building portfolios.
-# "1"     — intercept only
-# "JKP"   — JKP factors only (no intercept)
-# "JKP+1" — JKP factors + intercept  (original behaviour)
+# Residualize embeddings on: "1" intercept, "JKP" factors, or "JKP+1" factors + intercept
 RESIDUALIZE     = "JKP+1"
 
 _BASE    = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +58,7 @@ RESULTS_PATHS = {
 }
 SPLIT_DATE = pd.Timestamp("2013-12-31")
 
+# Evaluation windows for reported Sharpe ratios, split at SPLIT_DATE
 PERIODS = {
     "Full sample":   (None, None),
     "In-sample":     (None, SPLIT_DATE),
@@ -64,10 +67,16 @@ PERIODS = {
 
 
 def compute_sharpe(rets):
+    """Annualised Sharpe ratio of monthly returns, per column."""
     return np.mean(rets, axis=0) / np.std(rets, axis=0) * np.sqrt(12)
 
 
 def build_portfolio(df, portfolio, n_random_feat=N_RANDOM_FEAT):
+    """Monthly managed-portfolio returns (dates × portfolios) from embedding signals and r_1.
+
+    "linear": one portfolio per embedding dimension (signal × return, averaged per date);
+    "random_feature": portfolios on random nonlinear features of the signals.
+    """
     if portfolio == "linear":
         signals = df.drop(columns=["r_1", "size_grp"])
         return (signals * df["r_1"].values.reshape(-1, 1)).groupby(
@@ -93,9 +102,13 @@ def _ridge_fit_predict_gpu(
     shrinkage: torch.Tensor, # (n_z,)
     normalize_by_trace: bool = True,
 ) -> torch.Tensor:           # (n_z,)
-    """Single-step ridge fit + predict, fully on GPU."""
+    """Single-step ridge fit + predict, fully on GPU.
+
+    MSRR weights β(z) = (X'X/t + zI)^{-1} X'1/t for every z; returns X_test β(z).
+    """
     t_, p_ = X_train.shape
 
+    # Scale the dimensionless shrinkage grid by the average signal energy
     if normalize_by_trace:
         trace = (X_train ** 2).mean()
         z = (p_ / t_) * shrinkage * trace
@@ -184,14 +197,15 @@ def run_experiment(df_port, rolling_window: int = None):
     """
     OOS for every ridge shrinkage value on the grid, computed on GPU.
 
-    Returns {period_label: np.ndarray of shape (n_z,)} — annualised Sharpe.
+    Returns ({period_label: np.ndarray (n_z + 2,)}, ret_df) — annualised Sharpe per z, avg, loo.
     """
     shrinkage = torch.tensor(DEFAULT_SHRINKAGE_GRID, dtype=torch.float32, device=DEVICE)
 
-    # move entire portfolio matrix to GPU once
+    # Move the full portfolio-return matrix to DEVICE once
     X_gpu = torch.tensor(df_port.values, dtype=torch.float32, device=DEVICE)
     all_dates = np.array(df_port.index)
 
+    # Expanding (or rolling) window: fit on months before `step`, predict month `step`
     oos_ret, loo_ret, pred_dates = [], [], []
     for step in tqdm(range(MIN_TRAIN, len(df_port)), leave=False):
         train_start = max(0, step - rolling_window) if rolling_window is not None else 0
@@ -225,6 +239,7 @@ def run_experiment(df_port, rolling_window: int = None):
         columns=all_cols,
     )
 
+    # Sharpe per evaluation period
     sharpes = {}
     for label, (start, end) in PERIODS.items():
         mask = np.ones(len(pred_dates), dtype=bool)
@@ -244,11 +259,11 @@ def run_experiment(df_port, rolling_window: int = None):
 
 
 def _sharpes_from_csv(csv_path: str) -> dict:
-    """Recompute per-ridge + avg Sharpes from a saved returns CSV."""
+    """Recompute per-ridge + avg (and loo, if saved) Sharpes from a saved returns CSV."""
     TARGET_STD = 0.10 / np.sqrt(12)
     ret_df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
 
-    # keep only columns matching the current shrinkage grid, drop avg/loo (recomputed below)
+    # Keep ridge columns on the current grid; avg is recomputed and loo carried over below
     ridge_cols = [str(z) for z in DEFAULT_SHRINKAGE_GRID]
     ret_df_ridge = ret_df[[c for c in ridge_cols if c in ret_df.columns]]
     loo_col = ret_df["loo"].values[:, None].astype(np.float32) if "loo" in ret_df.columns else None
@@ -261,7 +276,7 @@ def _sharpes_from_csv(csv_path: str) -> dict:
     oos_ret_scaled = oos_ret * (TARGET_STD / col_std)
     avg_ret        = np.nanmean(oos_ret_scaled, axis=1, keepdims=True)
 
-    # overwrite CSV preserving loo column if present
+    # Rewrite the CSV with the new avg column, preserving loo if present
     ret_df_out = ret_df_ridge.copy()
     ret_df_out["avg"] = avg_ret[:, 0]
     if loo_col is not None:
@@ -289,9 +304,11 @@ def _sharpes_from_csv(csv_path: str) -> dict:
 
 
 def run_all():
-    # results[portfolio][model][size_grp] = {period: scalar}
+    """Run MSRR for every portfolio type × model × size group, resuming from saved results."""
+    # results[portfolio][model][size_grp] = {period: Sharpe array over ridge z, avg, loo}
     results = {p: {m: {sg: None for sg in SIZE_GROUPS} for m in MODELS} for p in PORTFOLIOS}
 
+    # Resume from previously pickled results
     for portfolio in PORTFOLIOS:
         path = RESULTS_PATHS[portfolio]
         if os.path.exists(path):
@@ -357,6 +374,7 @@ def run_all():
 
 
 def save_oos_table(results, period="Out-of-sample"):
+    """Save a model × (ridge z, avg, loo) Sharpe table per portfolio type to CSV."""
     ridge_labels = [str(z) for z in DEFAULT_SHRINKAGE_GRID]
     all_cols = ridge_labels + ["avg", "loo"]
     for portfolio in PORTFOLIOS:
@@ -366,6 +384,7 @@ def save_oos_table(results, period="Out-of-sample"):
             if entry is None or period not in entry:
                 continue
             vals = entry[period]
+            # Older results may lack the avg and/or loo entries
             n = len(vals)
             if n == len(ridge_labels) + 2:
                 cols = ridge_labels + ["avg", "loo"]
@@ -387,7 +406,7 @@ def save_oos_table(results, period="Out-of-sample"):
 
 
 def _get_sharpe(results, portfolio, model, sg, period):
-    """Return Sharpe array (n_z,) for (portfolio, model, sg, period)."""
+    """Return Sharpe array (n_z + 2,) for (portfolio, model, sg, period)."""
     entry = results[portfolio][model][sg]
     if entry is None:
         return None
@@ -395,6 +414,7 @@ def _get_sharpe(results, portfolio, model, sg, period):
 
 
 def print_table(model_results, portfolio):
+    """Print one model's size group × ridge Sharpe table for each period."""
     col_labels = [str(z) for z in DEFAULT_SHRINKAGE_GRID] + ["avg", "loo"]
     for period in PERIODS:
         rows = {}
@@ -413,6 +433,7 @@ def print_table(model_results, portfolio):
 
 
 def plot_results(results):
+    """Bar chart of each model's OOS Sharpe for the z-averaged ("avg") strategy."""
     period   = "Out-of-sample"
     n_models = len(MODELS)
     x        = np.arange(n_models)
@@ -435,7 +456,7 @@ def plot_results(results):
         n_ridge = len(DEFAULT_SHRINKAGE_GRID)
         sharpe_vals = []
         for model in MODELS:
-            # average across size groups
+            # Sharpe of the vol-scaled "avg" strategy, averaged across size groups
             vals = [
                 float(arr[n_ridge])
                 for sg in SIZE_GROUPS
@@ -482,8 +503,6 @@ def plot_stock_counts(emb_path=None):
     from utils.path_manager import get_embeddings_path as _gep
     path = emb_path or _gep(MODELS[0])
     df = load_matched_ret_emb(path, filter_small=False)
-    dates = df.index.get_level_values("date")
-    
 
     groups = {sg: df[df["size_grp"] == sg] if sg != "all" else df for sg in SIZE_GROUPS}
     colors = {"large": "#2563eb", "mega": "#f59e0b", "all": "#6b7280"}
@@ -529,7 +548,7 @@ def plot_avg_returns():
 
         for portfolio in PORTFOLIOS:
             for model, color in zip(MODELS, MODEL_COLORS):
-                csv_path = os.path.join(RAW_DIR, f"returns_{portfolio}_{model}_{sg}.csv")
+                csv_path = os.path.join(RAW_DIR, f"returns_{portfolio}_{model}_{sg}_resid_{_resid_tag()}.csv")
                 if not os.path.exists(csv_path):
                     continue
                 ret_df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
@@ -595,7 +614,7 @@ def plot_avg_vs_loo_comparison(
 
     period_bounds = PERIODS[period]
 
-    # Collect data; only keep rows where ALL models have a CSV with both cols
+    # Keep a residualization row only if every model has a returns CSV with avg or loo
     rows = []
     for opt, label in RESID_OPTIONS:
         tag = _tag(opt)

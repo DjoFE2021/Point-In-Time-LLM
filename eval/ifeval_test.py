@@ -1,27 +1,8 @@
-"""
-IFEval: Instruction-Following Evaluation (multi-GPU prompt sharding).
+"""IFEval: instruction-following accuracy on the 541 google/IFEval prompts, checked programmatically via lm_eval.
 
-Evaluates how well a model follows verifiable constraints
-(word counts, formatting, keyword inclusion, etc.) — no LLM judge needed.
-
-Uses 541 prompts from google/IFEval with programmatic constraint checking
-via lm_eval's IFEval implementation.
-
-Usage:
-    # Multi-GPU (shard prompts across 4 GPUs):
-    torchrun --nproc_per_node=4 eval/ifeval_test.py --checkpoint /path/to/checkpoint.pt --model 4B
-
-    # Single GPU still works:
-    python eval/ifeval_test.py --checkpoint /path/to/checkpoint.pt --model 4B
-
-    # Evaluate a HuggingFace model
-    torchrun --nproc_per_node=4 eval/ifeval_test.py --candidate Qwen/Qwen1.5-1.8B-Chat
-
-    # Load pre-computed outputs (skip generation)
-    python eval/ifeval_test.py --outputs ifeval_outputs/model_outputs.json
-
-    # Quick debug
-    torchrun --nproc_per_node=4 eval/ifeval_test.py --candidate Qwen/Qwen1.5-1.8B-Chat --limit 10
+Generates responses (prompts sharded across GPUs, resumes from saved outputs) from a GPT checkpoint or HF model,
+then writes <output-dir>/<name>_outputs.json and <name>_summary.txt (default dir: ifeval_outputs_new).
+Usage: torchrun --nproc_per_node=4 eval/ifeval_test.py (--checkpoint <CKPT.pt> --model 4B | --candidate <HF_ID> | --outputs <JSON>)
 """
 
 import argparse
@@ -55,9 +36,7 @@ MODEL_CONFIGS = {
 }
 
 
-# ------------------------------------------------------------------
-# DDP helpers
-# ------------------------------------------------------------------
+# ---- DDP helpers ----
 def setup_distributed():
     """Initialize distributed if launched via torchrun, else single-GPU."""
     if "RANK" in os.environ:
@@ -73,18 +52,7 @@ def setup_distributed():
     return rank, local_rank, world_size, device
 
 
-def gather_strings(local_list, world_size):
-    """Gather a list of strings from all ranks to rank 0."""
-    if world_size == 1:
-        return local_list
-    gathered = [None] * world_size
-    dist.all_gather_object(gathered, local_list)
-    return [item for sublist in gathered for item in sublist]
-
-
-# ------------------------------------------------------------------
-# Checkpoint loading (same pattern as alpaca.py)
-# ------------------------------------------------------------------
+# ---- Checkpoint loading (same key handling as eval_multigpu.load_checkpoint) ----
 def load_custom_checkpoint(ckpt_path: str, model_size: str, device: str = "cuda"):
     """Load a training checkpoint into a fresh GPT model."""
     num_vocab = 50304
@@ -118,9 +86,7 @@ def load_custom_checkpoint(ckpt_path: str, model_size: str, device: str = "cuda"
     return model
 
 
-# ------------------------------------------------------------------
-# Generation: custom GPT model (autoregressive)
-# ------------------------------------------------------------------
+# ---- Generation: custom GPT model (autoregressive, no KV cache) ----
 @torch.inference_mode()
 def generate_custom(model, tokenizer, prompts, max_new_tokens=512,
                     temperature=0.7, top_p=0.9, device="cuda", start_idx=0,
@@ -137,6 +103,7 @@ def generate_custom(model, tokenizer, prompts, max_new_tokens=512,
             logits, _ = model(inp, targets=None, return_logits=True)
             next_logits = logits[0, -1, :]
 
+            # Nucleus (top-p) sampling; greedy decoding when temperature == 0
             if temperature > 0:
                 next_logits = next_logits / temperature
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
@@ -164,9 +131,7 @@ def generate_custom(model, tokenizer, prompts, max_new_tokens=512,
     return outputs
 
 
-# ------------------------------------------------------------------
-# Generation: HuggingFace model
-# ------------------------------------------------------------------
+# ---- Generation: HuggingFace model ----
 @torch.inference_mode()
 def generate_hf(model, tokenizer, prompts, max_new_tokens=512,
                 temperature=0.7, top_p=0.9, start_idx=0, label="HF",
@@ -194,16 +159,12 @@ def generate_hf(model, tokenizer, prompts, max_new_tokens=512,
     return outputs
 
 
-# ------------------------------------------------------------------
-# Prompt formatting for instruction-tuned models
-# ------------------------------------------------------------------
+# ---- Alpaca-style prompt template (custom checkpoints and HF models) ----
 def to_prompt(instruction: str) -> str:
     return f"### Instruction:\n{instruction.strip()}\n\n### Response:\n"
 
 
-# ------------------------------------------------------------------
-# IFEval scoring
-# ------------------------------------------------------------------
+# ---- IFEval scoring ----
 def evaluate_ifeval(examples, outputs):
     """
     Evaluate outputs against IFEval constraints.
@@ -241,9 +202,7 @@ def evaluate_ifeval(examples, outputs):
     }
 
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
+# ---- Main ----
 def main():
     parser = argparse.ArgumentParser(
         description="IFEval: Instruction-Following Evaluation (no LLM judge)")
@@ -293,7 +252,7 @@ def main():
 
     # --- Generate or load outputs ---
     if args.outputs:
-        # Pre-computed outputs: no generation needed, single-process is fine
+        # Pre-computed outputs; any missing ones are generated below
         src = Path(args.outputs)
         assert src.exists(), f"Outputs not found: {src}"
         with open(src) as f:
@@ -305,7 +264,7 @@ def main():
         if is_main:
             print(f"✅ Loaded {n_have} pre-computed outputs from {src}")
     else:
-        # Auto-detect existing outputs for resume
+        # Resume from outputs saved by a previous run, if any
         if out_path.exists():
             with open(out_path) as f:
                 records = json.load(f)
@@ -320,7 +279,7 @@ def main():
             n_have = 0
             n_need = len(examples)
 
-    # Generate missing outputs if needed — SHARD ACROSS GPUs
+    # Generate missing outputs, sharding the prompts across GPUs
     if n_need > 0:
         if is_main:
             if n_have > 0:
@@ -331,7 +290,7 @@ def main():
         missing_examples = examples[n_have:]
         missing_prompts = [to_prompt(ex["prompt"]) for ex in missing_examples]
 
-        # Shard prompts: rank gets every world_size-th prompt
+        # Rank r takes prompts r, r + world_size, r + 2 * world_size, ...
         my_prompts = missing_prompts[rank::world_size]
         my_start_idx = n_have + rank  # for progress display
 
@@ -392,9 +351,7 @@ def main():
         else:
             parser.error("Need --checkpoint or --candidate to generate missing outputs")
 
-        # Gather sharded results back in original order
-        # Each rank produced outputs for indices [rank, rank+ws, rank+2*ws, ...]
-        # We need to interleave them back
+        # Gather every rank's outputs and interleave them back into the original order
         if world_size > 1:
             all_shards = [None] * world_size
             dist.all_gather_object(all_shards, my_texts)

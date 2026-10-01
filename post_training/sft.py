@@ -1,15 +1,10 @@
-# SFT with LoRA — multi-GPU via PyTorch DDP.
-# Loads pre-tokenized data from data/sft_tokenized (produced by sft_tokens.py).
-#
-# Step 1: Tokenize the dataset first:
-#     python post_training/sft_tokens.py --max-length 2048
-#
-# Step 2: Run this training script (8 GPUs):
-#     torchrun --nproc_per_node=8 post_training/sft.py
+"""LoRA SFT of a point-in-time GPT checkpoint on tokenized timeless data (sft_tokens.py) with DDP.
+Env vars: CHECKPOINT_PATH (required), TOKENIZED_DATA_DIR, OUTPUT_DIR; adapter saved to OUTPUT_DIR/<ckpt_name>/.
+Usage: CHECKPOINT_PATH=<CKPT.pt> torchrun --nproc_per_node=8 post_training/sft.py
+"""
 
 import os
 import sys
-import math
 import time
 import torch
 import torch.distributed as dist
@@ -25,9 +20,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from models.GPT import GPT
 from models.GPTConfig import GPT2_4B  # change to GPT2_1B or GPT2_7B if needed
 
-# -----------------------------
-# DDP setup (torchrun sets these env vars)
-# -----------------------------
+# Base checkpoint to fine-tune (required, no default)
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH")
+if not CHECKPOINT_PATH:
+    sys.exit("CHECKPOINT_PATH is not set. Usage: "
+             "CHECKPOINT_PATH=<CKPT.pt> torchrun --nproc_per_node=8 post_training/sft.py")
+
+# DDP setup (torchrun sets RANK, LOCAL_RANK and WORLD_SIZE)
 assert torch.cuda.is_available(), "CUDA required for DDP training"
 dist.init_process_group(backend="nccl")
 ddp_rank = int(os.environ["RANK"])
@@ -40,30 +39,23 @@ master_process = (ddp_rank == 0)
 if master_process:
     print(f"DDP: {ddp_world_size} GPUs, this is rank {ddp_rank}")
 
-# -----------------------------
-# Config
-# -----------------------------
-CHECKPOINT_PATH = os.environ.get(
-    "CHECKPOINT_PATH",
-    "./2019-08_step=30931_checkpoint.pt",
-)
+# Config (paths can be overridden via env vars)
 MODEL_CONFIG = GPT2_4B
 TOKENIZED_DATA_DIR = os.environ.get("TOKENIZED_DATA_DIR", "./data/sft_tokenized")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "./model-sft")
 NUM_VOCAB = 50304
 
-# Extract checkpoint name from path (e.g. "2021-12_step=42325" from "2021-12_step=42325_checkpoint.pt")
+# Checkpoint name, e.g. "2021-12_step=42325" from "2021-12_step=42325_checkpoint.pt"
 _ckpt_basename = os.path.basename(CHECKPOINT_PATH)
 CHECKPOINT_NAME = _ckpt_basename.replace('_checkpoint.pt', '').replace('.pt', '')
 
-# Hyperparameters (tuned for H200 141GB VRAM)
-# RTX 5090 (32GB): BATCH_SIZE=2, GRAD_ACCUM_STEPS=2, LEARNING_RATE=5e-5
+# Hyperparameters tuned for H200 (141GB); on a 32GB GPU use BATCH_SIZE=2, LEARNING_RATE=5e-5
 NUM_EPOCHS = 1
 LEARNING_RATE = 2e-4         # scaled from 5e-5 (linear scaling with larger batch)
 WARMUP_STEPS = 100
-BATCH_SIZE = 10              # per-GPU micro-batch (halved to reduce VRAM)
+BATCH_SIZE = 10              # per-GPU micro-batch
 # Effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS * world_size
-GRAD_ACCUM_STEPS = 2         # doubled to keep same effective batch size
+GRAD_ACCUM_STEPS = 2
 LOGGING_STEPS = 10
 SAVE_STEPS = 10_000
 SAVE_TOTAL_LIMIT = 3
@@ -81,9 +73,7 @@ LORA_TARGET_MODULES = ["c_q", "c_k", "c_v", "c_proj", "c_fc"]
 torch.set_float32_matmul_precision("high")  # TF32 for matmuls
 torch.backends.cudnn.benchmark = True
 
-# -----------------------------
 # 1) Build model & load checkpoint
-# -----------------------------
 if master_process:
     print(f"Building model: {MODEL_CONFIG.__name__}")
 model = GPT(MODEL_CONFIG(vocab_size=NUM_VOCAB))
@@ -109,9 +99,7 @@ model.load_state_dict(new_sd)
 del ckpt, raw_sd, new_sd
 torch.cuda.empty_cache()
 
-# -----------------------------
 # 1b) Apply LoRA
-# -----------------------------
 if master_process:
     print(f"\n🔗 Applying LoRA (r={LORA_R}, alpha={LORA_ALPHA})...")
 lora_config = LoraConfig(
@@ -125,24 +113,20 @@ model = get_peft_model(model, lora_config)
 if master_process:
     model.print_trainable_parameters()
 
-# Gradient checkpointing: disabled on H200 (141GB VRAM is abundant, saves ~15% time)
-# To re-enable for smaller GPUs: model.base_model.model.gradient_checkpointing = True
+# Gradient checkpointing is ON (saves VRAM); set False on large GPUs for ~15% speed-up
 model.base_model.model.gradient_checkpointing = True
 if master_process:
-    print("  ⚡ Gradient checkpointing disabled (H200 has ample VRAM)")
+    print("  ⚡ Gradient checkpointing enabled")
 
 model.to(device=device, dtype=torch.bfloat16 if USE_BF16 else torch.float32)
-# NOTE: torch.compile not used with LoRA/peft to avoid graph break issues
+# torch.compile is not used with LoRA/peft to avoid graph-break issues
 
-# Wrap in DDP
 model = DDP(model, device_ids=[ddp_local_rank], gradient_as_bucket_view=True)
 model.train()
 if master_process:
     print(f"Model loaded with LoRA, wrapped in DDP across {ddp_world_size} GPUs")
 
-# -----------------------------
 # 2) Load pre-tokenized dataset (memory-mapped, not loaded into RAM)
-# -----------------------------
 if master_process:
     print(f"Loading pre-tokenized dataset from: {TOKENIZED_DATA_DIR}")
 dataset = load_from_disk(TOKENIZED_DATA_DIR)
@@ -178,9 +162,7 @@ dataloader = DataLoader(
     collate_fn=collate_fn, num_workers=0, pin_memory=True,
 )
 
-# -----------------------------
 # 3) Optimizer & scheduler
-# -----------------------------
 optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
 total_steps = (len(dataloader) // GRAD_ACCUM_STEPS) * NUM_EPOCHS
@@ -198,9 +180,7 @@ def lr_lambda(current_step):
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-# -----------------------------
 # 4) Training loop
-# -----------------------------
 if master_process:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 saved_checkpoints = []  # track for save_total_limit
@@ -283,14 +263,14 @@ for epoch in range(NUM_EPOCHS):
                 accum_loss = 0.0
                 log_start = time.time()
 
-            # Save checkpoint (rank 0 only) — save LoRA adapter weights only
+            # Periodically save LoRA adapter weights only (rank 0)
             if master_process and global_step % SAVE_STEPS == 0:
                 ckpt_dir = os.path.join(OUTPUT_DIR, CHECKPOINT_NAME, f"step={global_step}")
                 save_adapter_with_metadata(model.module, ckpt_dir, stage="sft")
                 print(f"  💾 Saved LoRA adapter: {ckpt_dir}")
 
                 saved_checkpoints.append(ckpt_dir)
-                # Enforce save_total_limit
+                # Keep only the newest SAVE_TOTAL_LIMIT step checkpoints
                 while len(saved_checkpoints) > SAVE_TOTAL_LIMIT:
                     old = saved_checkpoints.pop(0)
                     if os.path.exists(old):
@@ -298,15 +278,15 @@ for epoch in range(NUM_EPOCHS):
                         shutil.rmtree(old)
                         print(f"  🗑️  Removed old checkpoint: {old}")
 
-            # Barrier to keep all ranks in sync after checkpointing
+            # Sync all ranks after every optimizer step (rank 0 may have been saving)
             dist.barrier()
 
-    # End-of-epoch — save final adapter to model-sft/{checkpoint_name}/
+    # End of epoch: save the adapter to OUTPUT_DIR/<checkpoint_name>/
     if master_process:
         ckpt_dir = os.path.join(OUTPUT_DIR, CHECKPOINT_NAME)
         save_adapter_with_metadata(model.module, ckpt_dir, stage="sft")
         print(f"\n✅ Saved LoRA adapter to: {ckpt_dir}")
-        print(f"   To merge: python post_training/merge_lora.py --adapter {ckpt_dir}")
+        print(f"   To merge: python post_training/merge_lora.py --adapter {ckpt_dir} --base-checkpoint {CHECKPOINT_PATH}")
     dist.barrier()
 
 dist.barrier()

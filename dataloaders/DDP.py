@@ -1,12 +1,16 @@
+"""Distributed data loader for GPT pre-training: streams monthly .bin token shards and calls a
+month-end callback before any rank reads the next month.
+
+The .bin shard format (magic 20240520) and the loader design follow llm.c / modded-nanogpt (MIT licensed;
+see THIRD_PARTY_NOTICES.md).
+"""
 import glob
 import os
 import torch
-import errno
 
 import numpy as np
-import pandas as pd
 
-from typing import List, Dict, Any, Optional
+from typing import Optional
 
 MAGIC = 20240520
 VERSION = 1
@@ -63,14 +67,13 @@ def _peek_data_shard(filename):
             if token_bytes >= 0 and token_bytes % 2 == 0:
                 return token_bytes // 2
 
-    # Error handling consistent with your original behavior
+    # No usable header: report a wrong version or a missing magic number
     if saw_magic_wrong_version:
         raise AssertionError("unsupported version")
     if not saw_magic:
         print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        print("---> HINT: Do --data-dir / --val-dir point to .bin shards (glob patterns such as '<dir>/*.bin')?")
+        print("---> HINT: Shards are built with data/get_train_set.py and data/get_validation_set.py (see README)")
         exit(1)
 
     # If we saw magic+version but couldn't reconcile sizes
@@ -91,8 +94,7 @@ def _load_data_shard(filename):
         first24 = f.read(24)
         f.seek(0)
 
-        # Try (endianness, width) candidates and pick the one that matches
-        # magic, version, and file-size consistency.
+        # Pick the (endianness, header width) matching magic, version and file size
         candidates = [("<", 4), ("<", 8), (">", 4), (">", 8)]
         chosen = None
 
@@ -140,60 +142,6 @@ def _load_data_shard(filename):
     return tokens
 
 
-def save_checkpoint(model, dataloader, optimizer, scheduler, save_dir="checkpoints"):
-    """
-    Save a model checkpoint for the current data shard, using a lock file to
-    avoid concurrent writes. Optionally run a post-save callback (e.g., HellaSwag).
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The model to be checkpointed.
-    dataloader : DistributedDataLoader
-        Loader whose current shard name is used for checkpoint naming.
-    optimizer : list[torch.optim.Optimizer] or torch.optim.Optimizer
-        Optimizer(s) whose state dict(s) are saved alongside the model.
-    save_dir : str
-        Directory to save checkpoints. Default is "checkpoints".
-
-    Notes
-    -----
-    - Only the first process that successfully creates the lock file writes
-      the checkpoint. Others skip silently.
-    """
-    shard_fname = os.path.basename(dataloader.files[dataloader.current_shard])
-    # strip the ".bin" so our checkpoint is named "CC-MAIN-2013-20.pt"
-    shard_name = os.path.splitext(shard_fname)[0]
-
-    # prepare checkpoint paths
-    ckpt_path = os.path.join(save_dir, shard_name, f"GPT.pt")
-    lock_path = ckpt_path + ".lock"
-
-    os.makedirs(os.path.join(save_dir, shard_name), exist_ok=True)
-
-    # --- only the first process to create the lock does the save ---
-    try:
-        # atomic create, fail if exists
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-        # this is the winner — write the checkpoint
-        torch.save({
-            "model":     model.state_dict(),
-            "optimizers": [opt.state_dict() for opt in optimizer],
-            "schedulers" : [sch.state_dict() for sch in scheduler]
-        }, ckpt_path)
-
-        print(f"[INFO]: Saved checkpoint for shard {shard_name} → {ckpt_path}")
-
-    except OSError as e:
-        if e.errno == errno.EEXIST:
-            print("Lock already reached, skipping.")
-            # lock already created by another process → skip
-            pass
-        else:
-            raise
-
-
 class DistributedDataLoader:
     """
     Simple distributed-aware loader for tokenized shards on disk.
@@ -210,9 +158,12 @@ class DistributedDataLoader:
         Index of this process in ``[0, num_processes)``.
     num_processes : int
         Total number of parallel processes.
-    on_advance : callable
-        Callback executed when advancing to the next shard. Signature:
-        ``on_advance(model, dataloader, optimizer)``.
+    on_month_end : callable or None
+        Called on every rank when a month's data runs out, before any rank
+        reads data from the next month (see :meth:`advance`). Signature:
+        ``on_month_end(model, dataloader, optimizer, scheduler)``.
+    skip_files : str or None
+        Resume support: only shards whose path sorts after this one are used.
 
     Attributes
     ----------
@@ -230,24 +181,27 @@ class DistributedDataLoader:
     Notes
     -----
     Each process skips ahead in the token stream by ``process_rank * B * T``
-    to avoid overlapping batches across processes.
+    to avoid overlapping batches across processes. All processes switch shards
+    on the same call, so they are always reading the same month.
     """
 
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes, on_advance, skip_files):
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes, on_month_end, skip_files):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.B = B
         self.T = T
-        self.on_advance = on_advance
+        self.on_month_end = on_month_end
         
         # glob files that match the pattern
+        if os.path.isdir(filename_pattern):
+            raise ValueError(f"{filename_pattern} is a directory; pass a glob pattern such as '{filename_pattern}/*.bin'")
         self.files = np.array(sorted(glob.glob(filename_pattern)))
         if skip_files is not None:
             self.files = self.files[self.files > skip_files]
             
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
-        # load and validate all data shards, count number of tokens in total
+        # Validate every shard header and count the total number of tokens
         ntok_total = 0
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
@@ -256,7 +210,6 @@ class DistributedDataLoader:
             ntok_total += int(shard_ntok)
         self.ntok_total = ntok_total
 
-        # kick things off
         self.reset()
 
     def reset(self):
@@ -275,7 +228,7 @@ class DistributedDataLoader:
     def current_file_month(self) -> Optional[str]:
         """
         Extract the month identifier from the current shard filename.
-        
+
         Returns
         -------
         str or None
@@ -284,7 +237,11 @@ class DistributedDataLoader:
         """
         if self.current_shard >= len(self.files):
             return None
-        fname = os.path.basename(self.files[self.current_shard])
+        return self._file_month(self.current_shard)
+
+    def _file_month(self, shard_idx: int) -> Optional[str]:
+        """Month string of shard ``shard_idx`` (e.g. '2013-05'), or None if the name has no YYYY-MM."""
+        fname = os.path.basename(self.files[shard_idx])
         # Expected format: YYYY-MM.bin or YYYY-MM_partN.bin
         name = os.path.splitext(fname)[0]
         # Handle split files: 2013-12_part1 -> 2013-12
@@ -297,21 +254,28 @@ class DistributedDataLoader:
 
     def advance(self, model, optimizer, scheduler):
         """
-        Move to the next shard and invoke the advance callback.
+        Move to the next shard, calling ``on_month_end`` first if this ends a month.
+
+        A month ends when the next shard belongs to a different month or the
+        loader wraps around to the first shard. The callback runs before the
+        next shard is loaded, so no rank has read the next month's data yet.
 
         Parameters
         ----------
         model : torch.nn.Module or None
-            Model passed through to ``on_advance``. If ``None``, the callback
+            Model passed through to ``on_month_end``. If ``None``, the callback
             is skipped.
         optimizer : list[torch.optim.Optimizer] or torch.optim.Optimizer
-            Same object(s) passed through to ``on_advance``.
+            Same object(s) passed through to ``on_month_end``.
         """
-        if model is not None:
-            self.on_advance(model, self, optimizer, scheduler)
+        next_shard = (self.current_shard + 1) % len(self.files)
+        month = self.current_file_month()
+        month_ends = month is not None and (next_shard == 0 or self._file_month(next_shard) != month)
+        if model is not None and self.on_month_end is not None and month_ends:
+            self.on_month_end(model, self, optimizer, scheduler)
 
         # advance to next data shard (wrap-around modulo file count)
-        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_shard = next_shard
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
@@ -337,263 +301,22 @@ class DistributedDataLoader:
         -----
         - Uses an int32 intermediate NumPy cast to ensure compatibility with
           PyTorch's ``long`` dtype.
-        - When the end of the shard is reached for *all* processes, ``advance``
-          is called to load the next shard and optionally save a checkpoint.
+        - When the shard has no room for another full round (one batch per
+          process), ``advance`` is called on every process in the same call.
         """
         B = self.B
         T = self.T
-        # slice B*T+1 tokens: the last one is used only as the first target
+        # Slice B*T+1 tokens: the extra token is only used as the last target
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)   # targets
         # advance current position and load next shard if necessary
         self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+        # Check whether the next round fits from the round's start (rank 0's position), not this
+        # rank's own position, so that every rank switches shard on the same call. Otherwise
+        # higher ranks would move on to the next month before rank 0.
+        round_start = self.current_position - self.process_rank * B * T
+        if round_start + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance(model, optimizer, scheduler)
         return x.cuda(), y.cuda()
-    
-class DistributedDataLoaderSP:
-    
-    def __init__(self,
-                 filename_pattern,
-                 B,
-                 T,
-                 process_rank,
-                 num_processes,
-                 model_time,
-                 sp_len,
-                 pad_token_id: int = 50256,
-                 truncate_side: str = "right",
-                 is_training : bool = True,
-                 decoder : bool = False):
-        
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
-        self.sp_len = sp_len
-        self.pad_token_id = pad_token_id
-        self.truncate_side = truncate_side
-        self.decoder = decoder
-        
-        assert 0 <= self.sp_len < self.T, "soft_prompt_len must be >=0 and < T"
-        self.max_text_len = self.T - self.sp_len
-
-        # glob files that match the pattern
-        self.files = np.array(sorted(glob.glob(filename_pattern)))
-        
-        self.files = self.files[self.files < '/'.join(filename_pattern.split('/')[:-1])+ f"/{model_time}.parquet"]
-        
-        if is_training:
-            self.files = self.files[:-1]
-        else:
-            self.files = [self.files[-1]]
-        
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
-        
-        tot_ex = 0
-        max_tok = 0
-        for file in self.files:
-            n_ex, max_tok_file = self.peak_shard(file)
-            tot_ex += n_ex
-            if max_tok_file > max_tok:
-                max_tok = max_tok_file
-                
-        self.max_tok = max_tok
-            
-        print(f"We have {tot_ex} examples at disposition")
-        print(f"Max token size {max_tok}")
-            
-        self.current_shard = 0
-        self.current_position = 0 
-        self.epoch = 0
-        
-        # buffers for active shard
-        self._tokens: List[List[int]] = []
-        self._C: Optional[np.ndarray] = None
-        self._dates: List[str] = []
-        self._N: int = 0
-        self._order: Optional[np.ndarray] = None
-
-        # kick things off
-        self.reset()
-        
-    def load_shard(self, filename: str):
-        """
-        Load a Parquet shard and prepare internal buffers.
-        Expects columns: 'date' (YYYYMMDD), 'tokens' (list[int]), 'C' (list[float])
-        """
-        df = pd.read_parquet(filename)
-        if not {"date", "tokens", "C"}.issubset(df.columns):
-            raise ValueError(f"{filename} missing required columns (have {df.columns.tolist()})")
-
-        # ensure clean types
-        dates = df["date"].astype(str).tolist()
-        tokens_col = df["tokens"].tolist()
-        C_col = df["C"].tolist()
-
-        # convert C to 2D float32 array
-        try:
-            C_mat = np.array([np.array(c, dtype=np.float32) for c in C_col], dtype=np.float32)
-        except Exception as e:
-            raise ValueError(f"Column 'C' must be list-like per row. Got error: {e}")
-
-        # ensure tokens are list[int]
-        toks_list: List[List[int]] = []
-        for i, t in enumerate(tokens_col):
-            if isinstance(t, (list, tuple, np.ndarray)):
-                toks = [int(x) for x in t]
-            else:
-                raise ValueError(f"Row {i} 'tokens' must be list-like, got {type(t)}")
-            toks_list.append(toks)
-
-        # store
-        self._tokens = toks_list
-        self._C = C_mat
-        self._dates = dates
-        self._N = len(self._tokens)
-        self._order = np.arange(self._N)
-        
-    def peak_shard(self, filename : str):
-        
-        df = pd.read_parquet(filename)
-        
-        max_tok_file = df["tokens"].apply(len).max()
-        
-        return df.shape[0], max_tok_file
-            
-    def _advance_shard(self):
-        """Load next shard; if we pass the end, wrap and increment epoch."""
-        self.current_shard += 1
-        if self.current_shard >= len(self.files):
-            self.current_shard = 0
-            self.epoch += 1
-        self.load_shard(self.files[self.current_shard])
-        # reset position for this shard to the rank's offset
-        self.current_position = self.process_rank * self.B
-        
-    def reset(self):
-        """
-        Reset loader state to the beginning of the first shard for this process.
-
-        Notes
-        -----
-        Sets ``current_shard`` to 0 and ``current_position`` to the process-specific
-        offset, then loads the first shard's tokens.
-        """
-        self.current_shard = 0
-        self.current_position = self.process_rank * self.B
-        self.epoch = 0
-        self.load_shard(self.files[self.current_shard])
-        
-    def _prepare_batch_indices(self) -> Optional[np.ndarray]:
-        """
-        Return indices for the next mini-batch for this rank, or None if shard exhausted.
-        Uses rank-based striding with step B*num_processes.
-        """
-        if self._N == 0:
-            return None
-
-        start = self.current_position
-        end = start + self.B
-        if end > self._N:
-            return None  # force caller to advance shard
-
-        idx_in_shard = self._order[start:end]
-        # advance pointer for next call
-        self.current_position += self.B * self.num_processes
-        return idx_in_shard
-
-    def _truncate(self, toks: List[int]) -> List[int]:
-        """Truncate a token list to fit max_text_len according to truncate_side."""
-        if len(toks) <= self.max_text_len:
-            return toks
-        if self.truncate_side == "left":
-            return toks[-self.max_text_len:]
-        else:
-            return toks[:self.max_text_len]
-        
-    def _collate(self, batch_tokens: List[List[int]], batch_C: np.ndarray) -> Dict[str, Any]:
-        """Pad/truncate to uniform length and build tensors."""
-        # truncate and compute lengths
-        trunc = [self._truncate(t) for t in batch_tokens]
-        lengths = [len(t) for t in trunc]
-        if self.decoder:
-            T_text = self.max_tok
-        else:
-            T_text = max(1, lengths)  # avoid zero
-        B = len(trunc)
-
-        input_ids = torch.full((B, T_text), self.pad_token_id, dtype=torch.long)
-        input_ids_reverse = torch.full((B, T_text), self.pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros((B, T_text), dtype=torch.long)
-        labels = torch.full((B, T_text), -100, dtype=torch.long)
-
-        for i, t in enumerate(trunc):
-            L = len(t)
-            if L == 0:
-                continue
-            ids = torch.tensor(t, dtype=torch.long)
-            input_ids[i, :L] = ids
-            input_ids_reverse[i,-L:] = ids
-            attention_mask[i, :L] = 1
-            labels[i, :L] = ids
-            labels[i, 0] = -100  # mask first token target
-
-        c = torch.tensor(batch_C, dtype=torch.float32)
-        
-        attention_mask = (attention_mask != 0 )
-        
-        if self.decoder:
-            c = input_ids_reverse
-        
-        return {
-            "input_ids": input_ids,                     # [B, T_text]
-            "attention_mask": attention_mask,           # [B, T_text]
-            "c": c,   
-            "labels" : labels# [B, D]
-        }
-        
-    def next_batch(self) -> Dict[str, Any]:
-        """
-        Return the next mini-batch for this rank.
-        If the current shard can't provide a full mini-batch for all ranks, advance shards until it can.
-        """
-        while True:
-            idx = self._prepare_batch_indices()
-            if idx is None:
-                # shard exhausted for this rank; move on
-                self._advance_shard()
-                continue
-
-            # gather rows
-            btoks = [self._tokens[i] for i in idx]
-            bC = self._C[idx, :]
-            return self._collate(btoks, bC)
-        
-
-if __name__ == "__main__":
-    
-    loader = DistributedDataLoaderSP(
-                filename_pattern="/capstor/scratch/cscs/sjohanne/WSJ_token/*.parquet",
-                B=8,
-                T=2048,                 # full model context (incl. soft prompt)
-                process_rank=1,
-                num_processes=1,
-                model_time="202210",  # keep files strictly before this yyyyMM or yyyyMMdd name
-                sp_len=100,    # set to 0 if none
-                pad_token_id=50256,
-                decoder = True
-            )
-    breakpoint()
-    
-    batch = loader.next_batch()
-    
-    
-    breakpoint()
-    
-    
-    
-    tokens = _load_data_shard('/capstor/scratch/cscs/sjohanne/fineweb_monthly_7B/2015-01.bin')
-    breakpoint()

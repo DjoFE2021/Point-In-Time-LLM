@@ -1,22 +1,11 @@
 #!/bin/bash
-# ============================================================
-#  store_tokens.sh — Full data preparation pipeline
-#
-#  Goes through:
-#    1. Download raw datasets from HuggingFace  (store_raw_datasets.py)
-#    2. Classify time-aware vs timeless          (classify_time_aware.py)
-#    3. Tokenize SFT data                        (sft_tokens.py)
-#
-#  Usage:
-#    bash post_training/store_tokens.sh
-#
-#  To skip already-completed steps, each step checks if output
-#  exists before running. Use --force to re-run everything.
-# ============================================================
+# SFT data prep: download datasets, classify time-aware vs timeless, tokenize timeless data.
+# Usage: bash post_training/store_tokens.sh [--force]   (classification needs OPENAI_API_KEY)
+# Steps whose outputs already exist are skipped unless --force is given.
 
 set -euo pipefail
 
-# ── Config ──
+# Run from the repository root
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
@@ -36,21 +25,34 @@ if [ "$FORCE" = "--force" ]; then
     echo "🔄 Force mode: re-running all steps"
 fi
 
+# Datasets downloaded by store_raw_datasets.py and classified by classify_time_aware.py (must match their lists)
+DATA_DIR="data/post_training_dataset"
+DATASETS=(
+    "ai2-adapt-dev/evol_codealpaca_heval_decontaminated"
+    "ai2-adapt-dev/personahub_code_v2_34999"
+    "ai2-adapt-dev/tulu_v3.9_open_math_2_gsm8k_50k"
+    "ai2-adapt-dev/numinamath_tir_math_decontaminated"
+    "ai2-adapt-dev/personahub_ifdata_manual_seed_v3_29980"
+    "argilla/ifeval-like-data"
+)
+
+# True if $DATA_DIR/<dataset>/$1 exists and is non-empty for every dataset
+all_exist() {
+    local name
+    for name in "${DATASETS[@]}"; do
+        [ -s "$DATA_DIR/$name/$1" ] || return 1
+    done
+}
+
 echo ""
 echo "============================================================"
 echo "  Step 1/3: Download raw datasets from HuggingFace"
 echo "============================================================"
 echo ""
 
-if [ -d "data/post_training_dataset" ] && [ -z "$FORCE_FLAG" ]; then
-    # Check if all raw files exist
-    RAW_COUNT=$(find data/post_training_dataset -path "*/raw/data.jsonl" -type f 2>/dev/null | wc -l)
-    if [ "$RAW_COUNT" -ge 9 ]; then
-        echo "⏭  Raw datasets already exist ($RAW_COUNT datasets found), skipping."
-        echo "   Use --force to re-download."
-    else
-        python post_training/store_raw_datasets.py $FORCE_FLAG
-    fi
+if [ -z "$FORCE_FLAG" ] && all_exist "raw/data.jsonl"; then
+    echo "⏭  Raw datasets already exist (${#DATASETS[@]} datasets found), skipping."
+    echo "   Use --force to re-download."
 else
     python post_training/store_raw_datasets.py $FORCE_FLAG
 fi
@@ -61,9 +63,8 @@ echo "  Step 2/3: Classify time-aware vs timeless"
 echo "============================================================"
 echo ""
 
-TIMELESS_COUNT=$(find data/post_training_dataset -path "*/classified/timeless/data.jsonl" -type f 2>/dev/null | wc -l)
-if [ "$TIMELESS_COUNT" -ge 9 ] && [ -z "$FORCE_FLAG" ]; then
-    echo "⏭  Classification already done ($TIMELESS_COUNT datasets classified), skipping."
+if [ -z "$FORCE_FLAG" ] && all_exist "classified/timeless/data.jsonl"; then
+    echo "⏭  Classification already done (${#DATASETS[@]} datasets classified), skipping."
     echo "   Use --force to re-classify."
 else
     if [ -z "${OPENAI_API_KEY:-}" ]; then
@@ -101,5 +102,6 @@ echo "  Outputs:"
 echo "    SFT  → $SFT_OUTPUT"
 echo ""
 echo "  Next: run training with:"
-echo "    torchrun --nproc_per_node=8 post_training/sft.py"
+echo "    CHECKPOINT_PATH=<CKPT.pt> torchrun --nproc_per_node=8 post_training/sft.py"
+echo "    (or SFT + merge + IFEval per checkpoint: bash post_training/sft_all.sh <CKPT.pt> ...)"
 echo ""

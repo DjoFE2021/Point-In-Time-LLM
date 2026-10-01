@@ -1,3 +1,9 @@
+"""Embed DJN news articles with the point-in-time 4B checkpoints (latest one before each month).
+
+Last-token embeddings are averaged per (permno, day), then per (permno, month).
+Paths come from embeddings/experiments/.env (see .env.example); output: EMBEDDINGS_DIR/<output_dir_name()>.
+Usage: python embeddings/experiments/4b/main.py [--test] [--padding {left,right}] [--seed N] [--last_ckpt]
+"""
 import argparse
 import os
 import glob
@@ -9,28 +15,29 @@ import numpy as np
 import pandas as pd
 import tiktoken
 from collections import OrderedDict
+from dotenv import load_dotenv
 from pathlib import Path
 from typing import List, Tuple, Optional
 
-# Make models/ importable — the repo root is the nearest ancestor holding models/,
-# which keeps this working under both the repo layout (embeddings/experiments/4b)
-# and the flat cluster layout (embeddings/4b).
+# Make models/ importable from the nearest ancestor dir containing it (repo or cluster layout).
 sys.path.insert(0, str(next(
     p for p in Path(__file__).resolve().parents if (p / "models").is_dir()
 )))
 from models.GPT import GPT
 from models.GPTConfig import GPT2_4B
 
-DATASET_DIR       = "/scratch/jschwab/dataset/jkp_matched"
-CKPT_DIR          = "/scratch/jschwab/checkpoints/4B"
-CKPT_DIR_FULL     = "/scratch/jschwab/checkpoints/4B-full"
-OUTPUT_DIR        = "/scratch/jschwab/embeddings/4b-v2"
-OUTPUT_DIR_FULL   = "/scratch/jschwab/embeddings/4b-full-v2"
+# Paths come from the environment or embeddings/experiments/.env (see .env.example); main() checks them
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(ENV_FILE)
+
+DATASET_DIR       = os.environ.get("DJN_DATA_DIR", "")          # DJN_YYYY-MM_retmatched.pkl files
+CKPT_DIR          = os.environ.get("PIT_4B_CKPT_DIR", "")       # year-end checkpoints
+CKPT_DIR_FULL     = os.environ.get("PIT_4B_FULL_CKPT_DIR", "")  # only the final checkpoint (--last_ckpt)
+EMBEDDINGS_DIR    = os.environ.get("EMBEDDINGS_DIR", "")        # root of all embedding outputs
 MAX_TOKENS        = 2048
 BATCH_SIZE        = 64
 
-# Available checkpoints sorted chronologically as (year, month) tuples.
-# Add or remove entries here if checkpoints are added later.
+# Available checkpoints as (year, month) tuples, sorted chronologically.
 CHECKPOINTS: list[tuple[int, int]] = [
     (2013, 12),
     (2014, 12),
@@ -43,8 +50,20 @@ CHECKPOINTS: list[tuple[int, int]] = [
 ]
 
 
-def ckpt_stem(year: int, month: int) -> str:
-    return f"{year}-{month:02d}_checkpoint.pt"
+def find_checkpoint(ckpt_dir: str, year: int, month: int) -> str:
+    """Path of the (year, month) checkpoint in ckpt_dir.
+
+    Matches <YYYY-MM>_step=<N>_checkpoint.pt (as saved by training), else <YYYY-MM>_checkpoint.pt.
+    """
+    ym = f"{year}-{month:02d}"
+    matches = glob.glob(os.path.join(glob.escape(ckpt_dir), f"{ym}_step=*_checkpoint.pt"))
+    if not matches:
+        legacy = os.path.join(ckpt_dir, f"{ym}_checkpoint.pt")
+        matches = [legacy] if os.path.isfile(legacy) else []
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected exactly one {ym}_step=<N>_checkpoint.pt or {ym}_checkpoint.pt "
+                           f"in {ckpt_dir}, found: {sorted(matches)}")
+    return matches[0]
 
 
 def get_checkpoint_ym(file_year: int, file_month: int) -> tuple[int, int]:
@@ -70,17 +89,19 @@ def get_checkpoint_ym(file_year: int, file_month: int) -> tuple[int, int]:
 
 def load_4b_model(ckpt_year: int, ckpt_month: int, device: torch.device,
                   ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> GPT:
+    """Load a 4B checkpoint in eval mode (with last_ckpt: the single .pt file in ckpt_dir)."""
     if last_ckpt:
         pts = glob.glob(os.path.join(ckpt_dir, "*.pt"))
         if len(pts) != 1:
             raise RuntimeError(f"Expected exactly one .pt file in {ckpt_dir}, found: {pts}")
         path = pts[0]
     else:
-        path = os.path.join(ckpt_dir, ckpt_stem(ckpt_year, ckpt_month))
+        path = find_checkpoint(ckpt_dir, ckpt_year, ckpt_month)
     print(f"  Loading checkpoint: {path}", flush=True)
 
     model = GPT(GPT2_4B())
 
+    # Strip DDP / torch.compile prefixes from the state-dict keys
     ckpt = torch.load(path, map_location="cpu")
     raw_sd = ckpt["model"]
     new_sd = OrderedDict()
@@ -112,16 +133,14 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
     class _EarlyExit(Exception):
         pass
 
+    # Grab lm_head's input and abort the forward pass (logits are not needed)
     def _pre_hook(_, args):
         captured["hidden"] = args[0].detach()
         raise _EarlyExit()
 
     handle = model.lm_head.register_forward_pre_hook(_pre_hook)
 
-    # Tokenize all articles upfront and sort by length to minimise padding waste.
-    # Articles that tokenize to nothing have no last real token, so they are held
-    # out of the batches and left as NaN for aggregation to drop — batching them
-    # would either index a pad position or produce a zero-width batch.
+    # Tokenize once and sort by length to cut padding; empty articles are skipped and stay NaN.
     all_token_ids = [tokenizer.encode(text)[:MAX_TOKENS] for text in articles]
     n_embd = model.lm_head.weight.shape[1]
 
@@ -147,6 +166,7 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
 
             input_ids = torch.tensor(padded, dtype=torch.long).to(device)
 
+            # full_sequence feeds every position to lm_head (right padding needs non-final positions)
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 try:
                     model(input_ids, full_sequence=(padding == "right"))
@@ -234,6 +254,7 @@ def aggregate_embeddings(out_dir: Path) -> None:
 
 def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
            padding: str = "right", ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> None:
+    """Embed a contiguous chunk of the (checkpoint-sorted) work list on GPU `rank`."""
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     prefix = f"[GPU {rank}]" if torch.cuda.is_available() else "[CPU]"
 
@@ -253,6 +274,7 @@ def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
 
     try:
         for ckpt_ym, fpath in chunk:
+            # Load a new model only when the checkpoint changes
             if ckpt_ym != current_ckpt_ym:
                 if model is not None:
                     del model
@@ -294,12 +316,12 @@ def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
 
 def test_mode(padding: str = "right", seed: int = None,
               ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> None:
-    """Embed 3 randomly sampled articles and print sanity checks."""
+    """Embed 3 randomly sampled articles from one random file and print sanity checks."""
     rng = np.random.default_rng(seed)
 
     all_files = sorted(glob.glob(os.path.join(DATASET_DIR, "DJN_*_retmatched.pkl")))
     if not all_files:
-        print("No dataset files found — check DATASET_DIR.")
+        print("No dataset files found — check DJN_DATA_DIR.")
         return
 
     fpath = all_files[rng.integers(len(all_files))]
@@ -308,7 +330,7 @@ def test_mode(padding: str = "right", seed: int = None,
     file_year, file_month = int(date_part.split("-")[0]), int(date_part.split("-")[1])
     ckpt_ym = None if last_ckpt else get_checkpoint_ym(file_year, file_month)
 
-    print(f"=== TEST MODE ===")
+    print("=== TEST MODE ===")
     print(f"File       : {fname}")
     if last_ckpt:
         print(f"Checkpoint : (last_ckpt) {ckpt_dir}")
@@ -356,6 +378,24 @@ def test_mode(padding: str = "right", seed: int = None,
     print("\nTest passed.")
 
 
+def require_env(names: list[str]) -> None:
+    """Exit with a clear message if any of the named environment variables is unset or empty."""
+    missing = [name for name in names if not os.environ.get(name)]
+    if missing:
+        sys.exit(f"Missing environment variable(s) {', '.join(missing)}: "
+                 f"set them in {ENV_FILE} (see .env.example) or export them.")
+
+
+def output_dir_name(padding: str, last_ckpt: bool) -> str:
+    """Output subdirectory of EMBEDDINGS_DIR, named as in run_experiment.MODELS.
+
+    PIT-4B-right by default, 4b-full with --last_ckpt; a non-default padding side goes into the name.
+    """
+    if last_ckpt:
+        return "4b-full" if padding == "right" else f"4b-full-{padding}"
+    return f"PIT-4B-{padding}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Embed financial articles with the 4B model.")
     parser.add_argument("--test", action="store_true", help="Run sanity check on one file and exit.")
@@ -365,18 +405,23 @@ def main():
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for article selection in test mode.")
     parser.add_argument("--last_ckpt", action="store_true",
-                        help="Use the single final checkpoint from 4B-full instead of time-varying checkpoints. "
-                             "Saves results to the 4b-full output directory.")
+                        help="Use the single final checkpoint in PIT_4B_FULL_CKPT_DIR instead of time-varying "
+                             "checkpoints. Saves results to EMBEDDINGS_DIR/4b-full.")
     args = parser.parse_args()
 
+    # Check the paths this run needs (test mode writes nothing)
+    needed = ["DJN_DATA_DIR", "PIT_4B_FULL_CKPT_DIR" if args.last_ckpt else "PIT_4B_CKPT_DIR"]
+    if not args.test:
+        needed.append("EMBEDDINGS_DIR")
+    require_env(needed)
+
     ckpt_dir = CKPT_DIR_FULL if args.last_ckpt else CKPT_DIR
-    out_dir_str = OUTPUT_DIR_FULL if args.last_ckpt else OUTPUT_DIR
 
     if args.test:
         test_mode(padding=args.padding, seed=args.seed, ckpt_dir=ckpt_dir, last_ckpt=args.last_ckpt)
         return
 
-    out_dir = Path(out_dir_str)
+    out_dir = Path(EMBEDDINGS_DIR) / output_dir_name(args.padding, args.last_ckpt)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     num_gpus = torch.cuda.device_count()

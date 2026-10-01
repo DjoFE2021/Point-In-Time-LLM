@@ -1,3 +1,7 @@
+"""Random-feature managed portfolios for the embedding experiments.
+
+Random nonlinear features of the stock signals are multiplied by returns and averaged per date.
+"""
 import pandas as pd
 import numpy as np
 
@@ -36,10 +40,10 @@ def produce_random_feature_managed_returns_chunked(
     for seed in range(num_seeds):
         rng = np.random.default_rng(base_seed + seed)
 
-        # --- RF weights (P × d)
+        # Random-feature weights (P × d)
         omega = scale * rng.standard_normal((P, d)).astype(np.float32) * sqrt2_over_d
 
-        # --- RF activations (NT × P)
+        # Random-feature activations (NT × P)
         Z = X @ omega.T
 
         if activation == "relu":
@@ -51,7 +55,7 @@ def produce_random_feature_managed_returns_chunked(
         else:
             raise ValueError(f"Unknown activation '{activation}'")
 
-        # --- managed returns: collapse N → T immediately
+        # Managed returns: average return-weighted features per date (NT → T)
         weighted = Z * r
         df = pd.DataFrame(weighted, index=r1.index)
 

@@ -1,25 +1,9 @@
 #!/bin/bash
-# ============================================================
-#  sft_all.sh — SFT + IFEval for multiple point-in-time LLMs
-#
-#  Trains SFT on each checkpoint, merges LoRA, evaluates IFEval.
-#
-#  Usage:
-#    bash post_training/sft_all.sh \
-#        /mnt/llms/fineweb_pit/checkpoints/4B/2019-12_step=32559_checkpoint.pt \
-#        /mnt/llms/fineweb_pit/checkpoints/4B/2020-12_step=37442_checkpoint.pt \
-#        /mnt/llms/fineweb_pit/checkpoints/4B/2021-12_step=42325_checkpoint.pt
-#
-#    # Background:
-#    nohup bash post_training/sft_all.sh ckpt1.pt ckpt2.pt > sft_all.log 2>&1 &
-#
-#  Output structure:
-#    model-sft/{checkpoint_name}/adapter_model.safetensors
-#    model-sft/{checkpoint_name}/adapter_config.json
-#    model-sft/{checkpoint_name}_merged.pt
-#    ifeval_outputs/{checkpoint_name}_sft_outputs.json
-#    ifeval_outputs/{checkpoint_name}_sft_summary.txt
-# ============================================================
+# Per 4B checkpoint: IFEval (base), LoRA SFT, merge, IFEval (merged), then a summary table.
+# Usage: bash post_training/sft_all.sh <checkpoint1.pt> [checkpoint2.pt ...]
+#   (in background: nohup bash post_training/sft_all.sh ckpt1.pt ckpt2.pt > sft_all.log 2>&1 &)
+# Outputs: model-sft/<name>/ (LoRA adapter), model-sft/<name>_merged.pt,
+#   ifeval_outputs_new/<name>_summary.txt (base IFEval) and <name>_merged_summary.txt (SFT IFEval).
 
 set -euo pipefail
 
@@ -37,12 +21,27 @@ fi
 if [ $# -eq 0 ]; then
     echo "Usage: bash post_training/sft_all.sh <checkpoint1.pt> [checkpoint2.pt] ..."
     echo "Example:"
-    echo "  bash post_training/sft_all.sh /mnt/llms/fineweb_pit/checkpoints/4B/*_checkpoint.pt"
+    echo "  bash post_training/sft_all.sh <CHECKPOINT_DIR>/*_checkpoint.pt"
     exit 1
 fi
 
 NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())")
 SFT_DIR="model-sft"
+IFEVAL_DIR="ifeval_outputs_new"  # passed to eval/ifeval_test.py --output-dir
+
+# Checkpoint name as derived by sft.py and eval/ifeval_test.py (e.g. "2021-12_step=42325")
+ckpt_name() {
+    basename "$1" | sed -e 's/_checkpoint\.pt//g' -e 's/\.pt//g'
+}
+
+# Prompt-level strict accuracy from an ifeval_test.py summary file ("--" if the file or line is missing)
+ifeval_score() {
+    local score=""
+    if [ -f "$1" ]; then
+        score=$(awk '$1 == "prompt_level_strict_acc:" {print $2}' "$1")
+    fi
+    echo "${score:---}"
+}
 
 echo ""
 echo "============================================================"
@@ -56,10 +55,12 @@ echo "============================================================"
 echo ""
 
 for CKPT in "$@"; do
-    # Extract checkpoint name (e.g. "2021-12_step=42325" from path)
-    CKPT_NAME=$(basename "$CKPT" | sed 's/_checkpoint\.pt$//' | sed 's/\.pt$//')
+    CKPT_NAME=$(ckpt_name "$CKPT")
     ADAPTER_DIR="$SFT_DIR/$CKPT_NAME"
     MERGED_PT="$SFT_DIR/${CKPT_NAME}_merged.pt"
+    # Written by eval/ifeval_test.py, which names its files after the checkpoint file
+    BASE_SUMMARY="$IFEVAL_DIR/${CKPT_NAME}_summary.txt"
+    SFT_SUMMARY="$IFEVAL_DIR/${CKPT_NAME}_merged_summary.txt"
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -67,14 +68,14 @@ for CKPT in "$@"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # ── Step 0: IFEval on base model (before SFT) ──────────────
-    BASE_SUMMARY="ifeval_outputs/${CKPT_NAME}_base_summary.txt"
     if [ -f "$BASE_SUMMARY" ]; then
         echo "  ⏭  Base IFEval already evaluated: $BASE_SUMMARY"
     else
         echo "  📋 Evaluating IFEval on base model..."
         torchrun --nproc_per_node=1 eval/ifeval_test.py \
             --checkpoint "$CKPT" \
-            --model 4B
+            --model 4B \
+            --output-dir "$IFEVAL_DIR"
     fi
 
     # ── Step 1: SFT training ────────────────────────────────────
@@ -99,15 +100,15 @@ for CKPT in "$@"; do
             --output "$MERGED_PT"
     fi
 
-    # ── Step 3: IFEval on SFT model (after) ─────────────────────
-    SFT_SUMMARY="ifeval_outputs/${CKPT_NAME}_sft_summary.txt"
+    # ── Step 3: IFEval on merged SFT model ──────────────────────
     if [ -f "$SFT_SUMMARY" ]; then
         echo "  ⏭  SFT IFEval already evaluated: $SFT_SUMMARY"
     else
         echo "  📋 Evaluating IFEval on SFT model..."
         torchrun --nproc_per_node=1 eval/ifeval_test.py \
             --checkpoint "$MERGED_PT" \
-            --model 4B
+            --model 4B \
+            --output-dir "$IFEVAL_DIR"
     fi
 
     echo "  ✅ Done: $CKPT_NAME"
@@ -118,20 +119,13 @@ echo "============================================================"
 echo "  ✅ All SFT + IFEval evaluations complete! $(date)"
 echo "============================================================"
 echo ""
+# Summary table: IFEval prompt-level strict accuracy, base vs SFT
 printf "  %-30s %10s %10s\n" "Checkpoint" "Base" "SFT"
 printf "  %-30s %10s %10s\n" "──────────────────────────────" "──────────" "──────────"
 for CKPT in "$@"; do
-    CKPT_NAME=$(basename "$CKPT" | sed 's/_checkpoint\.pt$//' | sed 's/\.pt$//')
-    BASE_SUMMARY="ifeval_outputs/${CKPT_NAME}_base_summary.txt"
-    SFT_SUMMARY="ifeval_outputs/${CKPT_NAME}_sft_summary.txt"
-    BASE_SCORE="--"
-    SFT_SCORE="--"
-    if [ -f "$BASE_SUMMARY" ]; then
-        BASE_SCORE=$(grep "Prompt-Level Strict" "$BASE_SUMMARY" | awk '{print $NF}')
-    fi
-    if [ -f "$SFT_SUMMARY" ]; then
-        SFT_SCORE=$(grep "Prompt-Level Strict" "$SFT_SUMMARY" | awk '{print $NF}')
-    fi
+    CKPT_NAME=$(ckpt_name "$CKPT")
+    BASE_SCORE=$(ifeval_score "$IFEVAL_DIR/${CKPT_NAME}_summary.txt")
+    SFT_SCORE=$(ifeval_score "$IFEVAL_DIR/${CKPT_NAME}_merged_summary.txt")
     printf "  %-30s %10s %10s\n" "$CKPT_NAME" "$BASE_SCORE" "$SFT_SCORE"
 done
 echo ""

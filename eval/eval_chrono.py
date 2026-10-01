@@ -1,30 +1,26 @@
-# chronogpt_lmeval.py
+"""Evaluate the ChronoGPT baseline (manelalab/chrono-gpt-*) on lm-eval benchmarks via a custom TemplateLM.
+
+Re-implements the ChronoGPT architecture for inference (adapted from manelalab's ChronoGPT_inference.py,
+MIT licensed; see THIRD_PARTY_NOTICES.md) and saves one CSV per model to --output-dir.
+Usage: python eval/eval_chrono.py --repo-id manelalab/chrono-gpt-v1-20241231 [--tasks hellaswag] [--limit 20]
+"""
 from __future__ import annotations
 
-import os
-os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"  # allow legacy dataset scripts (e.g. social_iqa)
-
-
 import gc
+import json
+import math
+import os
 from typing import Any, Dict, List, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 from lm_eval.api.model import TemplateLM
 from lm_eval import utils as lm_utils  # get_rolling_token_windows, make_disjoint_window
 import tiktoken
 from tqdm import tqdm
-
-import os
-import json
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, List, Tuple
-from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -72,8 +68,7 @@ class CausalSelfAttention(nn.Module):
     @torch.inference_mode()
     def forward(self, x, ve):
         B, T = x.size(0), x.size(1)
-        
-        # Generate Q, K, V
+
         q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
         k = self.c_k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.c_v(x).view(B, T, self.num_heads, self.head_dim)
@@ -86,13 +81,13 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
         
-        # Use KV cache if available
+        # Prepend cached keys/values when a KV cache is set
         if self.kv_cache is not None:
             k = torch.cat([self.kv_cache[0], k], dim=1)
             v = torch.cat([self.kv_cache[1], v], dim=1)
             self.kv_cache = torch.stack([k, v])
 
-        # Efficient attention with flash attention if available
+        # Fused causal attention (flash / memory-efficient kernels) when PyTorch provides it
         if hasattr(F, 'scaled_dot_product_attention'):
             y = F.scaled_dot_product_attention(
                 q.transpose(1, 2),  # (B, num_heads, T, head_dim)
@@ -101,7 +96,7 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True
             )
         else:
-            # Fallback to regular attention
+            # Fallback: explicit masked softmax attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
             att = att.masked_fill(
                 torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool(),
@@ -147,27 +142,26 @@ class ValueEmbedding(nn.Module):
     def __init__(self, vocab_size, model_dim, num_layers=52):
         super().__init__()
         self.num_layers = num_layers
-        # We only have 3 distinct embedding modules, reused at beginning and end.
+        # Only 3 distinct value-embedding tables, shared by the first and last 3 layers
         self.embed = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
 
     def forward(self, inputs):
-        # Compute the base embeddings (a list of length 3)
         base = [emb(inputs).bfloat16() for emb in self.embed]
         L = self.num_layers
         half = L // 2  # number of encoder layers (assumes num_layers is even)
-        # Build encoder: first 3 layers get embeddings, rest get None.
+        # Encoder: first 3 layers get base[0..2], the rest get None
         encoder = [base[i] if i < 3 else None for i in range(half)]
-        # Build decoder: last 3 layers get embeddings, others get None.
-        # For decoder layers, if i is in [half-3, half-1] then assign base[0], base[1], base[2]
+        # Decoder: last 3 layers get base[0..2], the rest get None
         decoder = [base[i - (half - 3)] if i >= (half - 3) else None for i in range(half)]
         return encoder + decoder
 
 
 class ChronoGPT(nn.Module, PyTorchModelHubMixin):
+    """ChronoGPT decoder: encoder/decoder halves joined by U-Net style skip connections, plus value embeddings."""
     def __init__(self, vocab_size, num_layers, num_heads, model_dim, **kwargs):
         super().__init__()
         self.num_heads = num_heads
-        self.vocab_size = vocab_size  # Store vocab_size as instance variable
+        self.vocab_size = vocab_size
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, use_attn=True) for i in range(num_layers)])
         self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers=num_layers)
@@ -178,21 +172,20 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
     @torch.inference_mode()
     def forward(self, inputs, past_key_values=None):
-        # Remove fixed batch size assumption
-        B = inputs.size(0)  # Get batch size from input tensor
+        B = inputs.size(0)
         if inputs.dim() == 1:
             inputs = inputs.unsqueeze(0)  # Add batch dimension if not present
         
         x0 = norm(self.embed(inputs).bfloat16())
         x = x0
         
-        # Modify value embedding handling for batched input
+        # Value embeddings per sequence, then stacked per layer into batch tensors
         ve = [self.value_embeds(inputs[i].view(-1)) for i in range(B)]
         ve = [torch.stack([ve[b][i] for b in range(B)]) if ve[0][i] is not None else None 
               for i in range(len(ve[0]))]
         ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
 
-        # Handle cached states for batched input
+        # Load per-layer KV caches when provided
         if past_key_values is not None:
             for i, block in enumerate(self.blocks):
                 if block.attn is not None:
@@ -202,7 +195,7 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
         layer_outputs = []
         skip_connections = []
 
-        # Process through encoder layers
+        # Encoder half: keep each output for the U-Net style skip connections
         for i in range(self.num_encoder_layers):
             block = self.blocks[i]
             x = block(x, ve_enc[i], x0)
@@ -212,7 +205,7 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
             skip_connections.append(x)
             layer_outputs.append(norm(x))
 
-        # Process through decoder layers
+        # Decoder half: add weighted skip connections in reverse (LIFO) order
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
             block = self.blocks[self.num_encoder_layers + i]
@@ -224,6 +217,7 @@ class ChronoGPT(nn.Module, PyTorchModelHubMixin):
 
         x = norm(x)
         logits = self.lm_head(x)
+        # Soft-cap logits to (-15, 15)
         logits = 15 * torch.tanh(logits / 15)
 
         return logits.float(), layer_outputs
@@ -285,7 +279,7 @@ class ChronoGPTLM(TemplateLM):
         # ---- tokenizer ----
         self._tok = tiktoken.get_encoding("gpt2")
 
-        # gpt2 EOT is 50256; try to get it robustly if tiktoken supports it
+        # GPT-2 EOT id is 50256; read it from tiktoken when possible
         self._eot_token_id = 50256
         try:
             self._eot_token_id = self._tok.encode(
@@ -323,8 +317,7 @@ class ChronoGPTLM(TemplateLM):
 
         self._model = model
 
-        # ---- max_length (context length) ----
-        # Try common names, else default.
+        # ---- max_length (context length): first matching config key, else 2048 ----
         if max_length is None:
             max_length = (
                 config.get("block_size")
@@ -372,7 +365,7 @@ class ChronoGPTLM(TemplateLM):
     # ---------------- tokenization ----------------
 
     def tok_encode(self, string: str, add_special_tokens: bool | None = None, **kwargs) -> List[int]:
-        # allow_special="all" avoids crashes if special tokens appear
+        # allowed_special="all" avoids errors when special tokens appear in the text
         return self._tok.encode(string, allowed_special="all")
 
     def tok_decode(self, tokens: List[int]) -> str:
@@ -405,8 +398,7 @@ class ChronoGPTLM(TemplateLM):
         results: List[Tuple[float, bool]] = []
         bs = max(1, int(self.batch_size))
 
-        # simple batching (right-pad is safe for causal LMs)
-        n_batches = (len(requests) + bs - 1) // bs
+        # Simple batching; right-padding is safe for causal LMs
         pbar = tqdm(total=len(requests), desc="loglikelihood", disable=disable_tqdm)
         for start in range(0, len(requests), bs):
             chunk = requests[start : start + bs]
@@ -423,13 +415,11 @@ class ChronoGPTLM(TemplateLM):
                     input_lens.append(1)
                     continue
 
-                # Truncate to fit model context.
-                # We feed: input_tokens = ctx + cont[:-1]
-                # So constraint is: len(ctx) + len(cont) - 1 <= max_length
+                # Input is ctx + cont[:-1]; left-truncate so len(ctx) + len(cont) - 1 <= max_length
                 max_seq = self.max_length
 
                 if len(cont_enc) > max_seq:
-                    # Can't score more than max_seq tokens with ctx_len>=1
+                    # At most max_seq continuation tokens can be scored (context needs >= 1 token)
                     cont_enc = cont_enc[-max_seq:]
 
                 max_ctx = max_seq - len(cont_enc) + 1
@@ -467,7 +457,7 @@ class ChronoGPTLM(TemplateLM):
                 inp_len = input_lens[i]
                 k = len(cont_ids)
 
-                # Score the last k logits from the *unpadded* portion
+                # Last k positions of the unpadded input predict the k continuation tokens
                 lp_slice = log_probs[i, inp_len - k : inp_len, :]  # [k, V]
 
                 cont_t = torch.tensor(cont_ids, dtype=torch.long, device=self.device)  # [k]
@@ -488,7 +478,7 @@ class ChronoGPTLM(TemplateLM):
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False) -> List[float]:
         """
         Uses lm_eval.utils.get_rolling_token_windows + make_disjoint_window to chunk
-        long strings into max_length windows. :contentReference[oaicite:3]{index=3}
+        long strings into max_length windows.
         """
         out: List[float] = []
         for (string,) in tqdm([req.args for req in requests], desc="rolling_ll", disable=disable_tqdm):
@@ -525,7 +515,7 @@ class ChronoGPTLM(TemplateLM):
         top_k: int | None,
         top_p: float | None,
     ) -> int:
-        # Greedy by default
+        # Greedy when sampling is off or temperature is 0
         if (not do_sample) or temperature == 0.0:
             return int(torch.argmax(logits_1d).item())
 
@@ -598,13 +588,13 @@ class ChronoGPTLM(TemplateLM):
                 tp = g.get("top_p", None)
                 topps.append(float(tp) if tp is not None else None)
 
-                # default behavior: sample if temperature > 0 unless do_sample explicitly provided
+                # Sample when temperature > 0, unless do_sample is given explicitly
                 if "do_sample" in g:
                     do_samples.append(bool(g["do_sample"]))
                 else:
                     do_samples.append(t > 0.0)
 
-            # Tokenize prompts
+            # Tokenize prompts; an empty prompt starts from the prefix (EOT) token
             seqs: List[List[int]] = [self.tok_encode(c) for c in contexts]
             for i, s in enumerate(seqs):
                 if len(s) == 0:
@@ -640,7 +630,7 @@ class ChronoGPTLM(TemplateLM):
                     if finished[i]:
                         continue
                     if step >= max_news[i]:
-                        # reached token budget
+                        # Reached this request's token budget
                         txt = self.tok_decode(gen_tokens[i])
                         final_text[i] = _truncate_at_any(txt, untils[i])
                         finished[i] = True
@@ -675,7 +665,7 @@ class ChronoGPTLM(TemplateLM):
                             final_text[i] = cut_txt
                             finished[i] = True
 
-            # finalize
+            # Decode sequences that used all steps without hitting a stop condition
             for i in range(len(seqs)):
                 if final_text[i] is None:
                     txt = self.tok_decode(gen_tokens[i])
@@ -688,6 +678,7 @@ class ChronoGPTLM(TemplateLM):
 
 
 def _truncate_at_any(text: str, stops: List[str]) -> str:
+    """Cut text at the earliest occurrence of any stop string."""
     if not stops:
         return text
     cut = None
@@ -700,7 +691,6 @@ def _truncate_at_any(text: str, stops: List[str]) -> str:
     return text if cut is None else text[:cut]
 
 
-# run_eval.py
 if __name__ == "__main__":
     import csv
     import argparse

@@ -1,3 +1,7 @@
+"""Architecture presets (vocab, layers, heads, width) for models/GPT.py.
+
+The paper's models are GPT2_1B and GPT2_4B; GPT2_7B is an extra.
+"""
 from dataclasses import dataclass
 
 @dataclass
@@ -10,11 +14,11 @@ class GPT2_1B:
     vocab_size : int, optional
         Size of the tokenizer vocabulary. Default is 50304.
     n_layer : int, optional
-        Number of Transformer blocks. Default is 12.
+        Number of Transformer blocks. Default is 52.
     n_head : int, optional
-        Number of attention heads. Default is 6.  # head dim 128 suggested by @Grad62304977
+        Number of attention heads. Default is 12.  # head dim 128 suggested by @Grad62304977
     n_embd : int, optional
-        Embedding (model) dimension. Default is 768.
+        Embedding (model) dimension. Default is 1536.
     """
     vocab_size : int = 50304
     n_layer : int = 52
@@ -29,11 +33,9 @@ class GPT2_4B:
     GH200 (92GB): batch_size=4 ~9500tokens/GPU multinode (40)
     H200 (144GB): batch_size=6 ~35000tokens/GPU single node
     H200 (144GB): batch_size=8 ~39000tokens/GPU single node
-    
-    # NOTE DID I MISCONFIGURE THIS ONE
     B200 (180GB): batch_size=6 ~35000tokens/GPU single node 
 
-    GPT-2–style ~4B config (compatible with your GPT class).
+    GPT-2–style ~4B config for models/GPT.py.
     Head dim stays 128 via n_embd // n_head.
     """
     vocab_size : int = 50304
@@ -46,21 +48,9 @@ class GPT2_4B:
 class GPT2_7B:
     """
     GPT-2–style ~7B config.
-    head_dim = 6144 // 48 = 128.
+    head_dim = 4096 // 32 = 128.
     """
     vocab_size : int = 50304
     n_layer    : int = 32
-    n_head     : int = 32     # head_dim = 6144 // 48 = 128
+    n_head     : int = 32     # head_dim = 4096 // 32 = 128
     n_embd     : int = 4096
-
-
-@dataclass
-class GPT2_Tiny:
-    """
-    Tiny GPT-2–style config for dry-runs and CI (~500K params).
-    head_dim = 256 // 2 = 128.
-    """
-    vocab_size : int = 50304
-    n_layer    : int = 4
-    n_head     : int = 2      # head_dim = 256 // 2 = 128
-    n_embd     : int = 256

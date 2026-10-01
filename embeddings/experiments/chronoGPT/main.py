@@ -1,18 +1,31 @@
+"""Embed news articles with ChronoGPT year-end snapshots (year Y uses the Y-1 model, no look-ahead).
+
+Article embeddings are averaged per stock-day, then per stock-month, into embeddings_monthly.pkl.
+Paths come from embeddings/experiments/.env (see .env.example); output: EMBEDDINGS_DIR/<output_dir_name()>.
+Usage: python embeddings/experiments/chronoGPT/main.py [--model-type base|instruct] [--padding left|right] [--test [--seed N]]
+"""
 import argparse
 import os
 import glob
 import pickle
+import sys
 import torch
 import torch.multiprocessing as mp
 import numpy as np
 import pandas as pd
 from datetime import date
+from dotenv import load_dotenv
 from pathlib import Path
+
+# Paths come from the environment or embeddings/experiments/.env (see .env.example); main() checks them.
+# Loaded before utils imports huggingface_hub, so an HF_HOME set there is honoured as well.
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(ENV_FILE)
 
 from utils import load_model
 
-DATASET_DIR = "/scratch/jschwab/dataset/jkp_matched"
-OUTPUT_BASE = "/scratch/jschwab/embeddings"
+DATASET_DIR = os.environ.get("DJN_DATA_DIR", "")        # DJN_YYYY-MM_retmatched.pkl files
+EMBEDDINGS_DIR = os.environ.get("EMBEDDINGS_DIR", "")   # root of all embedding outputs
 FIRST_MODEL_YEAR = 2013
 LAST_MODEL_YEAR = 2024
 MAX_TOKENS = 1792
@@ -23,7 +36,7 @@ def get_model_year(file_year: int) -> int:
     """Map a data year to the ChronoGPT snapshot used to embed it.
 
     Articles are embedded fully out-of-sample: year Y is embedded with the
-    (Y-1)-12-31 model.  Everything up to and including 2012 uses the 2012
+    (Y-1)-12-31 model.  Everything up to and including 2013 uses the 2013
     model (the only in-sample period).  Years beyond LAST_MODEL_YEAR are
     not supported.
     """
@@ -58,16 +71,14 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
     class _EarlyExit(Exception):
         pass
 
+    # Grab lm_head's input and abort the forward pass (logits are not needed)
     def _pre_hook(_, args):
         captured["hidden"] = args[0].detach()
         raise _EarlyExit()
 
     handle = model.lm_head.register_forward_pre_hook(_pre_hook)
 
-    # Tokenize all articles upfront and sort by length to minimise padding waste.
-    # Articles that tokenize to nothing have no last real token, so they are held
-    # out of the batches and left as NaN for aggregation to drop — batching them
-    # would either index a pad position or produce a zero-width batch.
+    # Tokenize once, sort by length to cut padding; empty articles are skipped and stay NaN
     all_token_ids = [tokenizer.encode(text)[:MAX_TOKENS] for text in articles]
     model_dim = model.lm_head.weight.shape[1]
 
@@ -134,7 +145,7 @@ def worker(rank: int, num_gpus: int, work_list: list, model_type: str, out_dir: 
     """Embed a contiguous chunk of the work list on GPU `rank`.
 
     The work list is pre-sorted by model_year so each GPU loads at most a
-    handful of models (usually just one for the large 2012 group).
+    handful of models (usually just one for the large 2013 group).
     """
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     prefix = f"[GPU {rank}]" if torch.cuda.is_available() else "[CPU]"
@@ -199,7 +210,7 @@ def aggregate_embeddings(out_dir: Path) -> None:
       1. Mean over all articles for the same stock on the same day.
       2. Mean over all days for the same stock in the same month.
 
-    Saves a single DataFrame indexed by (permno, year_month) with one
+    Saves a single Series indexed by (permno, year_month) with one
     embedding vector per cell to out_dir/embeddings_monthly.pkl.
     """
     emb_files = sorted(out_dir.glob("*_embeddings.pkl"))
@@ -212,7 +223,6 @@ def aggregate_embeddings(out_dir: Path) -> None:
     for fpath in emb_files:
         with open(fpath, "rb") as f:
             df = pickle.load(f)
-        # Keep only what we need
         chunks.append(df[["permno", "Date", "embedding"]].copy())
 
     combined = pd.concat(chunks, ignore_index=True)
@@ -252,12 +262,12 @@ def aggregate_embeddings(out_dir: Path) -> None:
 
 
 def test_mode(model_type: str, padding: str = "right", seed: int = None) -> None:
-    """Embed 3 randomly sampled articles and print sanity checks."""
+    """Embed 3 randomly sampled articles from one random file and print sanity checks."""
     rng = np.random.default_rng(seed)
 
     all_files = sorted(glob.glob(os.path.join(DATASET_DIR, "DJN_*_retmatched.pkl")))
     if not all_files:
-        print("No dataset files found — check DATASET_DIR.")
+        print("No dataset files found — check DJN_DATA_DIR.")
         return
 
     fpath = all_files[rng.integers(len(all_files))]
@@ -265,7 +275,7 @@ def test_mode(model_type: str, padding: str = "right", seed: int = None) -> None
     file_year = int(fname.split("_")[1].split("-")[0])
     model_year = get_model_year(file_year)
 
-    print(f"=== TEST MODE ===")
+    print("=== TEST MODE ===")
     print(f"File       : {fname}")
     print(f"Model year : {model_year}")
 
@@ -308,6 +318,19 @@ def test_mode(model_type: str, padding: str = "right", seed: int = None) -> None
     print("\nTest passed.")
 
 
+def require_env(names: list[str]) -> None:
+    """Exit with a clear message if any of the named environment variables is unset or empty."""
+    missing = [name for name in names if not os.environ.get(name)]
+    if missing:
+        sys.exit(f"Missing environment variable(s) {', '.join(missing)}: "
+                 f"set them in {ENV_FILE} (see .env.example) or export them.")
+
+
+def output_dir_name(model_type: str, padding: str) -> str:
+    """Output subdirectory of EMBEDDINGS_DIR, named as in run_experiment.MODELS (e.g. chronogpt_base-right)."""
+    return f"chronogpt_{model_type}-{padding}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Embed financial articles with ChronoGPT.")
     parser.add_argument(
@@ -329,11 +352,17 @@ def main():
     )
     args = parser.parse_args()
 
+    # Check the paths this run needs (test mode writes nothing)
+    needed = ["DJN_DATA_DIR"]
+    if not args.test:
+        needed.append("EMBEDDINGS_DIR")
+    require_env(needed)
+
     if args.test:
         test_mode(args.model_type, padding=args.padding, seed=args.seed)
         return
 
-    out_dir = Path(OUTPUT_BASE) / f"chronogpt_{args.model_type}-v2"
+    out_dir = Path(EMBEDDINGS_DIR) / output_dir_name(args.model_type, args.padding)
 
     num_gpus = torch.cuda.device_count()
     print(f"Model type : {args.model_type}")

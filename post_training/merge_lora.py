@@ -1,12 +1,6 @@
-"""
-Merge a LoRA adapter with the base model and save in eval-compatible format.
-
-Usage:
-    python post_training/merge_lora.py --adapter my-model-sft-lora/epoch=1
-    python post_training/merge_lora.py --adapter my-model-sft-lora/final --output my-model-sft-lora/final_merged.pt
-
-Output: a single .pt file with {"model": state_dict} format, directly loadable
-by eval_hellaswag_multigpu.py and ifeval_test.py.
+"""Merge a LoRA SFT adapter into its base GPT checkpoint and save a {"model": state_dict} .pt file.
+The merged file loads like any pre-training checkpoint (e.g. in eval/ifeval_test.py).
+Usage: python post_training/merge_lora.py --adapter <ADAPTER_DIR> --base-checkpoint <CKPT.pt> [--model 4B] [--output <OUT.pt>]
 """
 
 import argparse
@@ -14,7 +8,7 @@ import os
 import sys
 import torch
 from collections import OrderedDict
-from peft import PeftModel, LoraConfig
+from peft import PeftModel
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from models.GPT import GPT
@@ -29,9 +23,8 @@ def main():
     parser = argparse.ArgumentParser(description="Merge LoRA adapter with base model")
     parser.add_argument("--adapter", type=str, required=True,
                         help="Path to LoRA adapter directory (from save_pretrained)")
-    parser.add_argument("--base-checkpoint", type=str,
-                        default="./2019-08_step=30931_checkpoint.pt",
-                        help="Path to base model checkpoint")
+    parser.add_argument("--base-checkpoint", type=str, required=True,
+                        help="Path to the base model checkpoint the adapter was trained on")
     parser.add_argument("--model", type=str, default="4B", choices=["1B", "4B", "7B"],
                         help="Model config")
     parser.add_argument("--output", type=str, default=None,
@@ -50,6 +43,7 @@ def main():
     ckpt = torch.load(args.base_checkpoint, map_location="cpu", mmap=True)
     raw_sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     new_sd = OrderedDict()
+    # Strip DDP / torch.compile prefixes from parameter names
     for k, v in raw_sd.items():
         name = k.replace("module._orig_mod.", "").replace("module.", "").replace("_orig_mod.", "")
         new_sd[name] = v
